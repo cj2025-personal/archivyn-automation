@@ -23,9 +23,11 @@ wheels/
 .installed.cfg
 *.egg
 
-# Excel files
+# Data files
 *.xlsx
 *.xls
+*.txt
+!requirements.txt
 
 # IDE
 .vscode/
@@ -61,6 +63,9 @@ config/key.json
 # Pipeline output & runtime artifacts
 output/
 .legend_last_stamp.txt
+data/*.db
+data/*.sqlite
+data/*.sqlite3
 
 # Dev / local artifacts
 admin-portal/screenshot-*.png

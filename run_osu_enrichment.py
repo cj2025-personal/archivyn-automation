@@ -9,13 +9,11 @@ Stages, in order:
      Files are processed in batches because Windows caps a command
      line at ~32K chars and there are thousands of .txt files.
   3. sync successful chunked runs into MongoDB (collection ``scholars``,
-     tagged ``scholar_type='osu'``) via LocalChunkedMongoSync. This is the
-     default storage destination.
-  4. (optional, --use-sqlite) mirror the same runs into SQLite.
+     tagged ``scholar_type='osu'``) via LocalChunkedMongoSync.
 
-MongoDB is the primary store. The legend pipeline's in-run Mongo sync stays
-disabled (it needs Pinecone); the post-pipeline sync in stage 3 handles Mongo
-directly from the local chunked JSON, matching the legendary runner.
+MongoDB is the default storage destination. The legend pipeline's in-run
+Mongo sync stays disabled (it needs Pinecone); the post-pipeline sync in
+stage 3 handles Mongo directly from the local chunked JSON.
 
 Usage:
     python run_osu_enrichment.py                          # all scholars
@@ -25,7 +23,6 @@ Usage:
     python run_osu_enrichment.py --skip-pipeline          # only collect URLs
     python run_osu_enrichment.py --skip-existing          # resume mode
     python run_osu_enrichment.py --skip-pinecone          # skip vector upload
-    python run_osu_enrichment.py --use-sqlite             # also mirror to SQLite
     python run_osu_enrichment.py --skip-mongodb           # don't write Mongo (debug)
 """
 from __future__ import annotations
@@ -145,14 +142,6 @@ def main() -> int:
     p.add_argument("--no-mongo-llm", action="store_true",
                    help="Disable LLM summaries during the Mongo sync "
                         "(faster, less curated output).")
-    p.add_argument("--use-sqlite", action="store_true",
-                   help="Also mirror chunked profiles into SQLite (off by default).")
-    p.add_argument("--sqlite-path", default="data/scholars.db",
-                   help="SQLite file to mirror chunked profiles into (with --use-sqlite).")
-    p.add_argument("--sqlite-table", default="osu_scholars",
-                   help="SQLite target table (with --use-sqlite).")
-    p.add_argument("--no-sqlite-llm", action="store_true",
-                   help="Disable LLM summaries when syncing to SQLite.")
     args = p.parse_args()
 
     if not args.skip_collection:
@@ -224,23 +213,6 @@ def main() -> int:
             print(f"[OSU] Mongo sync failed: {e}")
             return 1
 
-    if args.use_sqlite:
-        print()
-        print("=" * 80)
-        print(f"[OSU] Stage 4: mirror chunked profiles → SQLite ({args.sqlite_path})")
-        print("=" * 80)
-        try:
-            _sync_runs_to_sqlite(
-                runs_root=runs_root,
-                slugs=sync_slugs,
-                db_path=args.sqlite_path,
-                table=args.sqlite_table,
-                use_llm=not args.no_sqlite_llm,
-            )
-        except Exception as e:
-            print(f"[OSU] SQLite sync failed: {e}")
-            return 1
-
     if failed_batches:
         return 1
     print("[OSU] Done — scraping, chunking, and storage complete.")
@@ -283,40 +255,6 @@ def _sync_runs_to_mongo(
             sync.mongo_client.close()
         except Exception:
             pass
-
-
-def _sync_runs_to_sqlite(
-    runs_root: Path,
-    slugs: list,
-    db_path: str,
-    table: str,
-    use_llm: bool,
-) -> None:
-    """Walk every <timestamp>-<slug> run dir for the given slugs and upsert
-    each scholar into SQLite. Idempotent — re-syncing is safe."""
-    from sync_local_chunked_to_sqlite import LocalChunkedSqliteSync
-    from config import sqlite_utils
-
-    sync = LocalChunkedSqliteSync(db_path=db_path, table=table, use_llm=use_llm)
-    try:
-        if not runs_root.exists():
-            print(f"[SQLite] runs_root does not exist: {runs_root}")
-            return
-        run_dirs: list = []
-        for slug in slugs:
-            run_dirs.extend(sorted(runs_root.glob(f"*-{slug}")))
-        print(f"[SQLite] Found {len(run_dirs)} run dir(s) to sync.")
-        for run_dir in run_dirs:
-            chunks_root = run_dir / "chunked_profiles"
-            profiles_root = run_dir / "profiles"
-            sync.sync_from_roots(
-                chunks_root,
-                profiles_root if profiles_root.exists() else None,
-            )
-        total = sqlite_utils.count_scholars(sync.conn, table=table)
-        print(f"[SQLite] Done. Total rows in '{table}': {total}  (db={db_path})")
-    finally:
-        sync.close()
 
 
 if __name__ == "__main__":

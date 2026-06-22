@@ -5,16 +5,13 @@ Stages:
   1. collect_legendary_scholar_urls.py -> DDG -> legendary_scholars/final/*.txt
   2. run_legend_scholar_pipeline.py over the collected .txt files
   3. sync successful chunked runs into Mongo collection legend_scholars (default)
-  4. (optional, --use-sqlite) mirror the same successful runs into SQLite
 
-MongoDB is the primary store. Mongo sync is intentionally done with
-LocalChunkedMongoSync so legendary scholars stay out of the main scholars
-collection. SQLite is opt-in via --use-sqlite.
+MongoDB is the default storage destination. Mongo sync uses LocalChunkedMongoSync
+so legendary scholars stay out of the main scholars collection.
 """
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -129,36 +126,6 @@ def _sync_runs_to_mongo(
         sync.close()
 
 
-def _sync_runs_to_sqlite(
-    *,
-    runs_root: Path,
-    slugs: list[str],
-    db_path: str,
-    table: str,
-    use_llm: bool,
-) -> None:
-    from sync_local_chunked_to_sqlite import LocalChunkedSqliteSync
-    from config import sqlite_utils
-
-    sync = LocalChunkedSqliteSync(db_path=db_path, table=table, use_llm=use_llm)
-    try:
-        run_dirs: list[Path] = []
-        for slug in slugs:
-            run_dirs.extend(sorted(runs_root.glob(f"*-{slug}")))
-        print(f"[LegendSQLite] Found {len(run_dirs)} run dir(s) to sync.")
-        for run_dir in run_dirs:
-            chunks_root = run_dir / "chunked_profiles"
-            profiles_root = run_dir / "profiles"
-            sync.sync_from_roots(
-                chunks_root,
-                profiles_root if profiles_root.exists() else None,
-            )
-        total = sqlite_utils.count_scholars(sync.conn, table=table)
-        print(f"[LegendSQLite] Done. Total rows in '{table}': {total}  (db={db_path})")
-    finally:
-        sync.close()
-
-
 def _reset_mongo_collection(collection_name: str) -> None:
     import os
     from dotenv import load_dotenv
@@ -175,16 +142,6 @@ def _reset_mongo_collection(collection_name: str) -> None:
         print(f"[Legendary] Cleared Mongo collection: {collection_name}")
     finally:
         client.close()
-
-
-def _reset_sqlite_table(db_path: str, table: str) -> None:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(f"DROP TABLE IF EXISTS {table}")
-        conn.commit()
-        print(f"[Legendary] Dropped SQLite table if present: {table}  (db={db_path})")
-    finally:
-        conn.close()
 
 
 def main() -> int:
@@ -216,24 +173,13 @@ def main() -> int:
     parser.add_argument("--reset-mongo-collection", action="store_true")
     parser.add_argument("--no-mongo-llm", action="store_true",
                        help="Disable LLM summaries during Mongo sync.")
-    parser.add_argument("--use-sqlite", action="store_true",
-                       help="Also mirror chunked runs into SQLite (off by default).")
-    parser.add_argument("--sqlite-path", default="data/scholars.db")
-    parser.add_argument("--sqlite-table", default="legend_scholars")
-    parser.add_argument("--reset-sqlite-table", action="store_true")
-    parser.add_argument("--no-sqlite-llm", action="store_true",
-                       help="Disable LLM summaries during SQLite sync.")
     args = parser.parse_args()
 
     if args.reset_mongo_collection and args.skip_mongodb:
         raise ValueError("--reset-mongo-collection cannot be combined with --skip-mongodb")
-    if args.reset_sqlite_table and not args.use_sqlite:
-        raise ValueError("--reset-sqlite-table requires --use-sqlite")
 
     if args.reset_mongo_collection:
         _reset_mongo_collection(args.mongo_collection)
-    if args.reset_sqlite_table:
-        _reset_sqlite_table(args.sqlite_path, args.sqlite_table)
 
     if not args.skip_collection:
         print("=" * 80)
@@ -302,19 +248,6 @@ def main() -> int:
             slugs=sync_slugs,
             collection_name=args.mongo_collection,
             use_llm=not args.no_mongo_llm,
-        )
-
-    if args.use_sqlite:
-        print()
-        print("=" * 80)
-        print(f"[Legendary] Stage 4: mirror chunked runs -> SQLite ({args.sqlite_path})")
-        print("=" * 80)
-        _sync_runs_to_sqlite(
-            runs_root=runs_root,
-            slugs=sync_slugs,
-            db_path=args.sqlite_path,
-            table=args.sqlite_table,
-            use_llm=not args.no_sqlite_llm,
         )
 
     return return_code if "return_code" in locals() else 0
