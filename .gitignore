@@ -28,7 +28,6 @@ wheels/
 *.xls
 *.txt
 !requirements.txt
-!runtime.txt
 
 # IDE
 .vscode/

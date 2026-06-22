@@ -1,0 +1,12 @@
+# Render Blueprint (optional). Primary Python pin is .python-version (3.12.8).
+# If deploy still uses 3.14, set PYTHON_VERSION=3.12.8 in the Render dashboard.
+
+services:
+  - type: web
+    name: archivyn-automation-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
