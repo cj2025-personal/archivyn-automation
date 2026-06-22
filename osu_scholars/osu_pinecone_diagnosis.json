@@ -1,0 +1,55 @@
+{
+  "excel_valid_rows": 7395,
+  "local_matched_profiles": 6332,
+  "local_matched_chunks": 4435,
+  "broken_progress_fetch_batches": {
+    "10": {
+      "found": 10,
+      "checked": 10,
+      "error": null
+    },
+    "100": {
+      "found": 98,
+      "checked": 100,
+      "error": null
+    },
+    "500": {
+      "found": 477,
+      "checked": 500,
+      "error": null
+    },
+    "1000": {
+      "found": 953,
+      "checked": 1000,
+      "error": null
+    }
+  },
+  "direct_fetch_threshold": {
+    "100": {
+      "returned": 98,
+      "error": null
+    },
+    "150": {
+      "returned": 148,
+      "error": null
+    },
+    "200": {
+      "returned": 196,
+      "error": null
+    },
+    "250": {
+      "returned": 238,
+      "error": null
+    },
+    "300": {
+      "returned": 285,
+      "error": null
+    },
+    "350": {
+      "returned": 0,
+      "error": "(414)\nReason: Request-URI Too Large\nHTTP response headers: HTTPHeaderDict({'Server': 'awselb/2.0', 'Date': 'Sun, 14 Jun 2026 16:44:20 GMT', 'Content-Type': 'text/html', 'Content-Length': '142', 'Connection': 'close'})\nHTTP response body: <html>\r\n<head><title>414 Request-URI Too Large</title></head>\r\n<body>\r\n<center><h1>414 Request-URI Too Large</h1></center>\r\n</body>\r\n</html>\r\n\n"
+    }
+  },
+  "diagnosis": "pipeline_progress_report.py batches Pinecone fetch at 1000 IDs; Pinecone starts returning HTTP 414 Request-URI Too Large around 350 IDs for this dataset, so the script silently reports 0 coverage for large sets.",
+  "recommended_fix": "Reduce fetch batch size to 100 or use metadata-filter coverage queries."
+}

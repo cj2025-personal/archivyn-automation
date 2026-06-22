@@ -1,0 +1,45 @@
+fastapi>=0.115.0
+uvicorn>=0.31.1
+playwright==1.40.0
+pdfplumber==0.10.3
+PyPDF2>=3.0.0
+python-docx>=1.1.1
+openpyxl==3.1.2
+pandas==2.1.3
+requests>=2.32.2
+beautifulsoup4==4.12.2
+ollama>=0.2.0
+pydantic>=2.11.0,<3.0.0
+python-multipart>=0.0.9
+aiofiles==23.2.1
+httpx>=0.27.1
+nest-asyncio>=1.6.0
+pinecone>=5.0.0,<6.0.0
+sentence-transformers>=2.2.0
+python-dotenv>=1.0.0
+boto3>=1.35.0
+tiktoken>=0.5.0
+langchain>=0.1.0
+langchain-text-splitters>=0.0.1
+nltk>=3.8.0
+faiss-cpu>=1.7.4
+chromadb>=0.4.0
+tqdm>=4.65.0
+numpy>=1.24.0
+openai>=1.0.0
+google-cloud-aiplatform>=1.70.0
+psutil>=5.9.0
+pymongo>=4.6.0
+scholarly>=1.7.0
+free-proxy>=1.1.0
+apscheduler>=3.10.4
+
+# --- Enrichment pipeline rebuild ---------------------------------------
+# Anti-bot bypass (Part 1): TLS fingerprint impersonation. Playwright is
+# already pinned above; we only need curl_cffi on top. Both are
+# graceful-optional — bypass.py falls back to httpx when either is missing.
+curl_cffi>=0.7.0
+
+# YouTube full-caption retrieval (youtube_transcripts collector)
+youtube-transcript-api>=0.6.2
+

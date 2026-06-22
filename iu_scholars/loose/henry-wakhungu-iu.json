@@ -1,0 +1,253 @@
+[
+  {
+    "url": "https://www.historicstjohnschurch.org/the-speech/",
+    "title": "Patrick Henry's Liberty or Death Speech - Historic St. John's ...",
+    "snippet": "Give Me Liberty Or Give Me Death Speech by Patrick Henry to the Second Virginia Revolutionary Convention meeting at St. John\u2019s Church, Richmond, on March 23, 1775*",
+    "queries": [
+      "\"Henry K. Wakhungu\" (speech OR keynote OR \"prepared remarks\" OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "speech"
+    ]
+  },
+  {
+    "url": "https://copypastatext.com/tag/henry-speech-fnaf-6/",
+    "title": "Henry speech FNaF 6 - CopypastaText",
+    "snippet": "You have all been called here, into a labyrinth of sounds and smells, misdirection and misfortune. A labyrinth with no exit, a maze with no prize. You don't even realize that you are trapped.",
+    "queries": [
+      "\"Henry K. Wakhungu\" (speech OR keynote OR \"prepared remarks\" OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "speech"
+    ]
+  },
+  {
+    "url": "https://www.ushistory.org/documents/libertydeath.htm",
+    "title": "Give Me Liberty Or Give Me Death - US History",
+    "snippet": "Mar 23, 2011 \u00b7 View the original text of history's most important documents, including Patrick Henry's 'Give Me Liberty Or Give Me Death' Speech",
+    "queries": [
+      "\"Henry K. Wakhungu\" (speech OR keynote OR \"prepared remarks\" OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "speech"
+    ]
+  },
+  {
+    "url": "https://api.pageplace.de/preview/DT0400.9781292161280_A28546526/preview-9781292161280_A28546526.pdf",
+    "title": "Essential Statistics: Exploring the World through Data",
+    "snippet": "Speculation that cell phones might cause brain cancer began as early as 1993, when (as CNN reports) the interview show Larry King Live featured a man who claimed his wife died because of cancer caused by her heavy cell phone use.",
+    "queries": [
+      "\"Henry Wakhungu Indiana\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\")",
+      "\"Henry Wakhungu Indiana\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation)",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\")",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\") \"Indiana University\"",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation)",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation) \"Indiana University\"",
+      "\"Henry Wakhungu\" (testimony OR hearing OR \"statement for the record\" OR committee) \"Indiana University\"",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\")",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\") \"Indiana University\"",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation)",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation) \"Indiana University\"",
+      "\"henry wakhungu\" (testimony OR hearing OR \"statement for the record\" OR committee) \"Indiana University\"",
+      "\"henry wakhungu\" 1993 (interview OR \"Q&A\" OR podcast)"
+    ],
+    "intent": "testimony",
+    "intent_confidence": 0.44999999999999996,
+    "matched_terms": [
+      "committee",
+      "interview"
+    ]
+  },
+  {
+    "url": "https://www.minams.edu.pk/cPanel/ebooks/miscellaneous/Allan+G.+Bluman+-+Elementary+Statistics_+A+Step-By-Step+Approach.+9th+ed.-McGraw-Hill+Education+(2014).pdf",
+    "title": "ALLAN G. BLUMAN",
+    "snippet": "Animal Bites of Postal Workers, 525 Interview Errors, 526 Male and Female Workers, 522 Medical Supply Sales, 526 Senior Workers, 526 Too Long on the Telephone, 502",
+    "queries": [
+      "\"Henry Wakhungu Indiana\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\")",
+      "\"Henry Wakhungu Indiana\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation)",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\") \"Indiana University\"",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation)",
+      "\"Henry Wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation) \"Indiana University\"",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\")",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR \"conversation with\") \"Indiana University\"",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation)",
+      "\"henry wakhungu\" (interview OR \"Q&A\" OR podcast OR \"fireside chat\" OR conversation) \"Indiana University\""
+    ],
+    "intent": "interview",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "interview"
+    ]
+  },
+  {
+    "url": "https://link.springer.com/journal/41043/articles",
+    "title": "Journal of Health, Population and Nutrition - Springer",
+    "snippet": "4 days ago \u00b7 Uniting three important pillars of public health, Journal of Health, Population and Nutrition is an internationally renowned open access journal publishing ...",
+    "queries": [
+      "\"Henry K. Wakhungu\" (\"working paper\" OR \"journal article\" OR DOI OR \"research paper\")"
+    ],
+    "intent": "paper",
+    "intent_confidence": 0.45000000000000007,
+    "matched_terms": [
+      "journal"
+    ]
+  },
+  {
+    "url": "https://www.cambridge.org/core/journals/historical-journal/article/abs/new-explanation-for-the-reproductive-woes-and-midlife-decline-of-henry-viii/454C1E8A328B42C32A333AB8D21F0A02",
+    "title": "A NEW EXPLANATION FOR THE REPRODUCTIVE WOES AND MIDLIFE ...",
+    "snippet": "After his fortieth birthday, the king's mental and physical health underwent rapid deterioration. In this article, we argue that both his reproductive troubles and his midlife pathologies can be explained if Henry VIII were positive for the Kell blood group.",
+    "queries": [
+      "\"Henry K. Wakhungu\" (\"working paper\" OR \"journal article\" OR DOI OR \"research paper\")"
+    ],
+    "intent": "paper",
+    "intent_confidence": 0.30000000000000004,
+    "matched_terms": [
+      "journal"
+    ]
+  },
+  {
+    "url": "https://www.pnas.org/doi/10.1073/pnas.0912953109",
+    "title": "Green Revolution: Impacts, limits, and the path ahead | PNAS",
+    "snippet": "Jul 31, 2012 \u00b7 A detailed retrospective of the Green Revolution, its achievement and limits in terms of agricultural productivity improvement, and its broader impact at social, environmental, and economic levels is provided.",
+    "queries": [
+      "\"Henry K. Wakhungu\" (\"working paper\" OR \"journal article\" OR DOI OR \"research paper\")"
+    ],
+    "intent": "paper",
+    "intent_confidence": 0.44999999999999996,
+    "matched_terms": [
+      "doi"
+    ]
+  },
+  {
+    "url": "https://www.mheducation.com/highered/ideas/i/1336171-navidi-essential-statistics-3e-flipbook",
+    "title": "Essential Statistics, 3e - McGraw Hill",
+    "snippet": "Videos ehend the topic at hand. Exercise videos illustrate the authors working through selected exercises, following the solution methodol- gy employed in the text. These videos are closed-captioned for the hearing-impaired and meet the Americans with Disabilities Act Standar",
+    "queries": [
+      "\"Henry Wakhungu\" (testimony OR hearing OR \"statement for the record\" OR committee) \"Indiana University\"",
+      "\"henry wakhungu\" (testimony OR hearing OR \"statement for the record\" OR committee) \"Indiana University\""
+    ],
+    "intent": "testimony",
+    "intent_confidence": 0.44999999999999996,
+    "matched_terms": [
+      "hearing"
+    ]
+  },
+  {
+    "url": "https://oneill.indiana.edu/faculty-research/directory/profiles/faculty/full-time/wakhungu-henry.html",
+    "title": "Henry Wakhungu: : Faculty: Profiles: Faculty Directory: Faculty...",
+    "snippet": "Henry K. Wakhungu. Teaching Professor.Curriculum Vitae. Dr. Henry K. Wakhungu is an expert in development of growth simulation models for sustainable management of indigenous community forests, experimental designs in tropical forestry research, and service learning research.",
+    "queries": [
+      "\"Henry K. Wakhungu\" 1993 (speech OR keynote OR transcript)",
+      "\"Henry K. Wakhungu\" 2011 (speech OR keynote OR transcript)",
+      "\"Henry K. Wakhungu\" 2012 (speech OR keynote OR transcript)",
+      "\"Henry Wakhungu\" 1993 (speech OR keynote OR transcript)",
+      "\"Henry Wakhungu\" 2011 (speech OR keynote OR transcript)",
+      "\"Henry Wakhungu\" 2012 (speech OR keynote OR transcript)",
+      "\"henry wakhungu\" 1993 (speech OR keynote OR transcript)",
+      "\"henry wakhungu\" 2011 (speech OR keynote OR transcript)",
+      "\"henry wakhungu\" 2012 (speech OR keynote OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": []
+  },
+  {
+    "url": "https://today.iu.edu/iub/live/news/1031-first-teaching-professors-promoted",
+    "title": "First teaching professors promoted - IU Today",
+    "snippet": "Henry Wakhungu. Carol Kennedy-Armbruster.",
+    "queries": [
+      "\"Henry Wakhungu\" 2011 (speech OR keynote OR transcript)",
+      "\"Henry Wakhungu\" 2012 (speech OR keynote OR transcript)",
+      "\"henry wakhungu\" 2012 (speech OR keynote OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": []
+  },
+  {
+    "url": "https://21centuryscholars.indiana.edu/student-stories/alumni-stories/washington-aaricka.html",
+    "title": "Aarika Washington ('14): Alumni Stories: Student Stories: 21st Century...",
+    "snippet": "My Black Feminism class (taught by Maisha Wester) and my Chicano class were amazing!!! Dr. Claudia Drieling, Dr. Henry Wakhungu and Dr. Fernando Orejuela were some of my all-time favorites as well.",
+    "queries": [
+      "\"Dr. Henry Wakhungu\" 1993 (speech OR keynote OR transcript)",
+      "\"Dr. Henry Wakhungu\" 2011 (speech OR keynote OR transcript)",
+      "\"Dr. Henry Wakhungu\" 2012 (speech OR keynote OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": []
+  },
+  {
+    "url": "https://bulletins.iu.edu/iub/college/2011-2012/departments/african-studies/faculty.shtml",
+    "title": "Faculty : Academic Bulletin",
+    "snippet": "Assistant ProfessorsHenry K. Wakhungu (School of Public and Environmental Affairs)N. Brian Winchester (Center for the Study of Global Change)",
+    "queries": [
+      "\"Henry K. Wakhungu\" 1993 (speech OR keynote OR transcript)",
+      "\"Henry K. Wakhungu\" 2011 (speech OR keynote OR transcript)",
+      "\"Henry K. Wakhungu\" 2012 (speech OR keynote OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": []
+  },
+  {
+    "url": "https://ebin.pub/ise-elementary-statistics-ise-hed-statistics-4nbsped-9781264417001-1264417004.html",
+    "title": "ISE Elementary Statistics (ISE HED STATISTICS)... - EBIN.PUB",
+    "snippet": "e. The two longest speeches were 8460 words, by William Henry Harrison in 1841, and 5434 words, by William Howard Taft in 1909. Are either of these outliers? f. Construct a boxplot for these data. g. Describe the shape of this distribution. h. What is the 15th percentile? i...",
+    "queries": [
+      "\"Henry Wakhungu Indiana\" 1993 (speech OR keynote OR transcript)",
+      "\"Henry Wakhungu Indiana\" 2011 (speech OR keynote OR transcript)",
+      "\"Henry Wakhungu Indiana\" 2012 (speech OR keynote OR transcript)"
+    ],
+    "intent": "speech",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "speech"
+    ]
+  },
+  {
+    "url": "https://drhoffman.com/podcast-2/",
+    "title": "The Intelligent Medicine Podcast Archive - DR. RONALD HOFFMAN |",
+    "snippet": "Looking for the Intelligent Medicine podcast? You can listen to various podcasts uploaded by Dr. Hoffman by simply putting the URL into your favorite podcasting software.",
+    "queries": [
+      "\"Dr. Henry Wakhungu\" 1993 (interview OR \"Q&A\" OR podcast)"
+    ],
+    "intent": "interview",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "podcast"
+    ]
+  },
+  {
+    "url": "https://drgundry.com/the-dr-gundry-podcast/",
+    "title": "Dr. Steven Gundry's podcast The Dr. Gundry Podcast",
+    "snippet": "The Dr. Gundry Podcast explores the cutting-edge science of gut health and longevity practices. Each week, Dr. Gundry dives deep into how simple diet and lifestyle shifts can dramatically improve health, from reducing inflammation to supporting energy, focus, and healthy aging.",
+    "queries": [
+      "\"Dr. Henry Wakhungu\" 1993 (interview OR \"Q&A\" OR podcast)"
+    ],
+    "intent": "interview",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "podcast"
+    ]
+  },
+  {
+    "url": "https://drdrew.com/dr-drew-podcast/",
+    "title": "The Dr. Drew Podcast | Dr. Drew Official Website - drdrew.com",
+    "snippet": "Nov 21, 2022 \u00b7 Dr. Drew Pinsky, board certified internist and addiction medicine specialist, takes listener calls and talks to experts on a variety of topics.",
+    "queries": [
+      "\"Dr. Henry Wakhungu\" 1993 (interview OR \"Q&A\" OR podcast)"
+    ],
+    "intent": "interview",
+    "intent_confidence": 0.35,
+    "matched_terms": [
+      "podcast"
+    ]
+  }
+]

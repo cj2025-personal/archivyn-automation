@@ -1,0 +1,12 @@
+{
+  "total_runs": 76,
+  "flagged_runs": 76,
+  "reason_counts": {
+    "sections_lt_3": 32,
+    "raw_title_sections": 76,
+    "encoding_artifacts": 47,
+    "accepted_sources_lt_3": 27,
+    "chunks_lt_6": 20,
+    "disambiguation_or_wrong_entity": 7
+  }
+}

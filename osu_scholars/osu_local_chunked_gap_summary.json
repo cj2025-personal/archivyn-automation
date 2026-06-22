@@ -1,0 +1,6 @@
+{
+  "local_chunked_profiles": 4436,
+  "missing_pinecone": 205,
+  "missing_mongo": 537,
+  "missing_both": 197
+}

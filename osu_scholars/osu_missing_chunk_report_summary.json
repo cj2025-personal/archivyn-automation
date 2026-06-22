@@ -1,0 +1,8 @@
+{
+  "excel_valid_rows": 7395,
+  "matched_profile_json": 6335,
+  "matched_chunks": 4437,
+  "missing_profile_json": 1060,
+  "missing_chunks": 2958,
+  "duplicate_local_matches": 2
+}
