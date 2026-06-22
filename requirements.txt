@@ -33,6 +33,7 @@ pymongo>=4.6.0
 scholarly>=1.7.0
 free-proxy>=1.1.0
 apscheduler>=3.10.4
+PyJWT>=2.8.0
 
 # --- Enrichment pipeline rebuild ---------------------------------------
 # Anti-bot bypass (Part 1): TLS fingerprint impersonation. Playwright is

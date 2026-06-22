@@ -2,6 +2,8 @@
 
 import { useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 
+import { useAuth } from "@/app/providers/auth-provider";
+
 type ModuleField = {
   id: string;
   label: string;
@@ -251,6 +253,7 @@ function ModuleIcon({ category, mode }: { category: string; mode: ScriptModule["
 }
 
 export function AutomationModule() {
+  const { authEnabled, session, logout } = useAuth();
   const [modules, setModules] = useState<ScriptModule[]>([]);
   const [jobs, setJobs] = useState<ScriptJob[]>([]);
   const [activeModuleId, setActiveModuleId] = useState("");
@@ -851,6 +854,26 @@ export function AutomationModule() {
             </div>
           </div>
         </div>
+
+        {authEnabled && session ? (
+          <div className="session-card">
+            <div className="session-card__meta">
+              <strong>{session.user.name || session.user.username}</strong>
+              <span>{session.authContext.role ?? session.user.role ?? "signed in"}</span>
+            </div>
+            <button
+              className="ghost-button"
+              onClick={() => {
+                void logout().then(() => {
+                  window.location.href = "/login";
+                });
+              }}
+              type="button"
+            >
+              Sign out
+            </button>
+          </div>
+        ) : null}
 
         <nav className="module-nav" aria-label="Portal navigation">
           {NAV_LINKS.map((link) => (

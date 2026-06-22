@@ -3,16 +3,21 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from api.middleware.archivyn_auth import require_archivyn_auth
 from api.services.admin_script_runner import runner
 from api.services.admin_script_scheduler import scheduler_service
 from api.services.admin_script_store import store
 
 
-router = APIRouter(prefix="/api/admin/scripts", tags=["admin-scripts"])
+router = APIRouter(
+    prefix="/api/admin/scripts",
+    tags=["admin-scripts"],
+    dependencies=[Depends(require_archivyn_auth)],
+)
 portal_router = APIRouter(prefix="/admin", tags=["admin-portal"])
 
 
