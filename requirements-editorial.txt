@@ -1,0 +1,23 @@
+# Dependencies for the editorial pipeline stages only.
+#
+# The admin scheduler runs six of this repo's scripts on a nightly cron —
+# profile_quality_refresh, trend_ingestion_worker, daily_story_worker,
+# daily_story_personalize, daily_story_retry_failed and daily_story_eval — from
+# a container. Installing the full requirements.txt there would drag in
+# Playwright and its browsers, FastAPI, pdfplumber, openpyxl and the rest of the
+# scraping and document tooling, none of which those six import.
+#
+# This is the transitive import set of those entrypoints plus config/, checked
+# against their `import` lines rather than guessed. Keep it in sync when one of
+# those scripts takes a new dependency; the container build is the thing that
+# breaks, and it breaks loudly.
+#
+# Versions mirror requirements.txt so the two cannot drift apart silently.
+
+python-dotenv>=1.0.0
+pymongo>=4.6.0
+numpy>=1.24.0
+joblib>=1.3.0
+scikit-learn>=1.3.0
+sentence-transformers>=2.2.0
+google-cloud-aiplatform>=1.70.0

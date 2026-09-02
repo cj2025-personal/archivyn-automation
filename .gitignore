@@ -28,6 +28,9 @@ wheels/
 *.xls
 *.txt
 !requirements.txt
+# The editorial pipeline container installs from this rather than the full
+# requirements.txt, which would drag Playwright and its browsers into the image.
+!requirements-editorial.txt
 
 # IDE
 .vscode/
