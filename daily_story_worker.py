@@ -335,7 +335,7 @@ class DailyStoryWorker:
             raise ValueError("MONGODB_URI not found in environment variables")
 
         self.mongo_client = create_mongo_client(mongodb_uri)
-        db_name = resolve_mongo_db_name(mongodb_uri)
+        db_name = resolve_mongo_db_name(mongodb_uri, client=self.mongo_client)
         self.db = self.mongo_client[db_name]
 
         self.scholars_collection = self.db[scholars_collection]
@@ -3185,6 +3185,37 @@ Malformed output:
         High-reliability deterministic payload designed to pass strict validation gates.
         """
         ranked = [c for c in context_chunks if isinstance(c, dict)]
+        name_lc = safe_text(name).lower()
+        name_tokens = [
+            token for token in re.findall(r"[a-z]{3,}", name_lc)
+            if token not in {"sir", "dr", "prof", "professor"}
+        ]
+        surname = name_tokens[-1] if name_tokens else ""
+        first_person_pattern = re.compile(
+            r"(?:\bI\s+(?:argue|believe|write|wrote|contend|maintain|have|am|was|will|see|remember|want|think|enjoyed|realized|decided)\b|\b(?:we|our|ours|us)\b)",
+            flags=re.I,
+        )
+
+        def scholar_relevance(item: Dict[str, Any]) -> Tuple[int, int, int, float]:
+            text = safe_text(item.get("text"))
+            section = safe_text(item.get("section"))
+            lead = f"{section} {text[:800]}".lower()
+            full_name_hit = int(bool(name_lc and name_lc in lead))
+            surname_hits = len(re.findall(rf"\b{re.escape(surname)}\b", lead)) if surname else 0
+            third_person = int(not bool(first_person_pattern.search(text[:800])))
+            return (
+                full_name_hit,
+                min(3, surname_hits),
+                third_person,
+                self._chunk_quality_score(text),
+            )
+
+        relevant_ranked = [
+            c for c in ranked
+            if scholar_relevance(c)[0] or scholar_relevance(c)[1]
+        ]
+        if relevant_ranked:
+            ranked = relevant_ranked
         non_pub = [
             c for c in ranked
             if not self._is_publication_section(safe_text(c.get("section")))
@@ -3193,12 +3224,12 @@ Malformed output:
 
         preferred_ranked = sorted(
             preferred,
-            key=lambda c: self._chunk_quality_score(safe_text(c.get("text"))),
+            key=scholar_relevance,
             reverse=True,
         )
         ranked_ranked = sorted(
             ranked,
-            key=lambda c: self._chunk_quality_score(safe_text(c.get("text"))),
+            key=scholar_relevance,
             reverse=True,
         )
 
@@ -3229,16 +3260,34 @@ Malformed output:
 
         def excerpt(cid: str, max_len: int = 360) -> str:
             raw_text = chunk_map.get(cid, "")
-            raw = self._first_sentence(raw_text, max_len=max_len)
+            sentence_candidates = [
+                re.sub(r"\s+", " ", sentence).strip()
+                for sentence in re.split(r"(?<=[.!?])\s+", raw_text)
+            ]
+            sentence_candidates = [
+                sentence for sentence in sentence_candidates
+                if (
+                    8 <= self._count_words(sentence) <= 70
+                    and re.match(r"^[A-Z0-9]", sentence)
+                    and not first_person_pattern.search(sentence)
+                )
+            ]
+            named_candidates = [
+                sentence for sentence in sentence_candidates
+                if (name_lc and name_lc in sentence.lower())
+                or (surname and re.search(rf"\b{re.escape(surname)}\b", sentence, flags=re.I))
+            ]
+            raw = (named_candidates or sentence_candidates or [""])[0]
             if not raw and raw_text:
-                toks = re.findall(r"\S+", raw_text)
-                raw = " ".join(toks[:64]).strip()
-                if len(raw) > max_len:
-                    raw = raw[:max_len].rstrip() + "..."
+                raw = self._first_sentence(raw_text, max_len=max_len)
             raw = re.sub(r"\[chunk:[^\]]+\]", " ", safe_text(raw), flags=re.I)
             raw = re.sub(r"\s+", " ", raw).strip()
+            if first_person_pattern.search(raw):
+                raw = ""
+            if len(raw) > max_len:
+                raw = raw[:max_len].rsplit(" ", 1)[0].rstrip(" ,;:") + "."
             if not raw:
-                raw = "Documented scholarship in this corpus provides a grounded historical reference point."
+                raw = f"The verified profile corpus documents {name}'s scholarship and institutional work."
             return raw
 
         c1 = chosen_ids[0]
@@ -3337,8 +3386,8 @@ Malformed output:
             article = self._upsert_sources_section(article, source_urls)
 
         return {
-            "title": f"Historical Lens: {title_core}",
-            "standfirst": "A synthetic, citation-grounded commentary generated for editorial review using archived scholar evidence.",
+            "title": f"Historical Lens: {name} on {title_core}",
+            "standfirst": f"A citation-grounded {name} lens generated for editorial review using verified archived evidence.",
             "article_markdown": article,
             "trend_source_url": trend_source_url,
             "source_urls": source_urls,
@@ -4897,6 +4946,7 @@ Return only JSON.
                 [
                     r"\bi\s+(?:argue|believe|write|wrote|contend|maintain|have|am|was|will|see|remember|want|think)\b",
                     r"\bmy\s+(?:work|research|life|view|argument|books|career|teaching)\b",
+                    r"\b(?:we|our|ours|us)\b",
                 ]
             )
 
@@ -4958,6 +5008,7 @@ Return only JSON.
         max_scholars: int,
         max_context_chunks: int,
         dry_run: bool,
+        force_regenerate: bool = False,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         story_date = date_value.isoformat()
@@ -4975,6 +5026,7 @@ Return only JSON.
                 "max_scholars": max_scholars,
                 "max_context_chunks": max_context_chunks,
                 "dry_run": dry_run,
+                "force_regenerate": force_regenerate,
                 "model_name": self.model_name if self.use_llm else "none",
                 "require_human_review": self.require_human_review,
                 "assume_deceased": self.assume_deceased,
@@ -5067,11 +5119,12 @@ Return only JSON.
                 {"story_key": story_key},
                 {"_id": 1, "status": 1},
             )
+            existing_status = ""
             if existing_story:
                 existing_status = safe_text(existing_story.get("status")).lower()
                 if existing_status == "failed_validation":
                     self.stories_collection.delete_one({"_id": existing_story["_id"]})
-                else:
+                elif not force_regenerate:
                     summary["skipped_existing"] += 1
                     continue
 
@@ -5439,6 +5492,17 @@ Return only JSON.
                 },
             }
 
+            if force_regenerate and existing_story and existing_status != "failed_validation":
+                if valid:
+                    self.stories_collection.replace_one(
+                        {"_id": existing_story["_id"]},
+                        story_doc,
+                    )
+                    summary["generated"] += 1
+                else:
+                    all_errors.append(f"{profile_id}:regeneration_rejected_existing_story_retained")
+                continue
+
             try:
                 self.stories_collection.insert_one(story_doc)
                 if valid:
@@ -5547,6 +5611,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Relax deceased-scholar safety policy (not recommended for historical figures)",
     )
+    parser.add_argument(
+        "--force-regenerate",
+        action="store_true",
+        help="Regenerate an existing story and replace it only when the new draft passes validation",
+    )
     return parser
 
 
@@ -5580,6 +5649,7 @@ def main() -> int:
             max_scholars=args.max_scholars,
             max_context_chunks=args.max_context_chunks,
             dry_run=args.dry_run,
+            force_regenerate=args.force_regenerate,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("status") != "failed" else 1

@@ -8,15 +8,69 @@ from typing import Optional
 DEFAULT_DB_NAME = "ngo_profiles"
 
 
-def resolve_mongo_db_name(mongodb_uri: str, default: str = DEFAULT_DB_NAME) -> str:
+def resolve_mongo_db_name(mongodb_uri: str, default: str = DEFAULT_DB_NAME, *, client=None) -> str:
+    candidates = []
+    if default == DEFAULT_DB_NAME:
+        env_override = (os.getenv("MONGODB_DB") or "").strip()
+        if env_override:
+            candidates.append(env_override)
+
     try:
         from urllib.parse import urlparse
 
         parsed = urlparse(mongodb_uri)
         db_name = parsed.path.lstrip("/").split("?")[0] if parsed.path else default
-        return db_name or default
+        if db_name:
+            candidates.append(db_name)
     except Exception:
-        return default
+        pass
+
+    if default:
+        candidates.append(default)
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        normalized = (candidate or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_candidates.append(normalized)
+
+    if client is None:
+        return unique_candidates[0] if unique_candidates else default
+
+    try:
+        existing_databases = [
+            name
+            for name in client.list_database_names()
+            if name and name not in {"admin", "config", "local"}
+        ]
+    except Exception:
+        existing_databases = []
+
+    existing_database_set = set(existing_databases)
+    for candidate in unique_candidates:
+        if candidate in existing_database_set:
+            return candidate
+
+    if DEFAULT_DB_NAME in existing_database_set:
+        return DEFAULT_DB_NAME
+
+    if existing_databases:
+        # A database nobody named: the cluster holds data under another name
+        # (after a migration, say). Say so, loudly, rather than quietly reading
+        # and writing somewhere no setting points at.
+        import sys
+
+        print(
+            f"[mongodb_utils] none of {unique_candidates or [default]} exists on this cluster; "
+            f"using '{existing_databases[0]}'. Set MONGODB_DB to choose explicitly.",
+            file=sys.stderr,
+        )
+        return existing_databases[0]
+
+    return unique_candidates[0] if unique_candidates else default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -108,4 +162,3 @@ def create_mongo_client(
                 ) from last_error
 
             time.sleep(backoff_s * (2 ** (attempt - 1)))
-

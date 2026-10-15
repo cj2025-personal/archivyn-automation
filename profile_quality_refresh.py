@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -128,7 +129,7 @@ def run_quality_refresh(*, max_scholars: int, scholar_id: str | None, update_sch
         jobs.create_index("run_id", unique=True)
         jobs.create_index("started_at")
 
-        run_id = f"quality-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+        run_id = f"quality-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
         started_at = utc_now_iso()
         job_doc = {
             "run_id": run_id,
@@ -239,4 +240,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
