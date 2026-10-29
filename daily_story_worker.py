@@ -136,6 +136,14 @@ NAME_BANNED_TOKENS = {
     "school", "society", "supplies", "university", "www", "www.",
 }
 
+# Output budget for one article call. On gemini-2.5 models the model's thinking
+# is counted against max_output_tokens, so the old 6200 left a long, rule-heavy
+# prompt too little room: drafts stopped partway (383-745 words, closing
+# sections missing) and every one became a template. At 24000, 4 of 6 retried
+# drafts came back whole (2026-10-29). Unused budget costs nothing.
+STRICT_MAX_OUTPUT_TOKENS = 24000
+DEFAULT_MAX_OUTPUT_TOKENS = 12000
+
 # The editor notes a fallback leaves on a draft whose prose is a fixed template
 # rather than the model's article. Such a draft is never sent to review.
 TEMPLATE_DRAFT_NOTES = frozenset({
@@ -462,7 +470,7 @@ class DailyStoryWorker:
         self.section_end_citation_ratio = float(safe_text(os.getenv("STORY_SECTION_END_CITATION_RATIO")) or 0.75)
         self.max_output_tokens = int(
             safe_text(os.getenv("STORY_MAX_OUTPUT_TOKENS"))
-            or (6200 if self.strict_reliability else 3200)
+            or (STRICT_MAX_OUTPUT_TOKENS if self.strict_reliability else DEFAULT_MAX_OUTPUT_TOKENS)
         )
         self.max_output_tokens = max(1200, self.max_output_tokens)
         self.require_standard_structure = (

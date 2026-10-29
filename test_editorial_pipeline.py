@@ -154,6 +154,13 @@ class TemplateDraftTests(unittest.TestCase):
         self.assertEqual(error, "template_not_article:llm_non_json_fallback_generated")
         self.assertIsNotNone(worker_module.template_failure(["strict_validation_fallback_pass"]))
 
+    def test_the_article_budget_leaves_room_for_the_model_s_thinking(self) -> None:
+        import daily_story_worker as worker_module
+
+        # The model thinks within the same budget; 6200 cut drafts short.
+        self.assertGreaterEqual(worker_module.STRICT_MAX_OUTPUT_TOKENS, 16000)
+        self.assertGreaterEqual(worker_module.DEFAULT_MAX_OUTPUT_TOKENS, 8000)
+
     def test_a_real_draft_or_a_dry_run_is_not_failed(self) -> None:
         import daily_story_worker as worker_module
 
