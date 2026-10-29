@@ -136,6 +136,23 @@ NAME_BANNED_TOKENS = {
     "school", "society", "supplies", "university", "www", "www.",
 }
 
+# The editor notes a fallback leaves on a draft whose prose is a fixed template
+# rather than the model's article. Such a draft is never sent to review.
+TEMPLATE_DRAFT_NOTES = frozenset({
+    "llm_non_json_fallback_generated",
+    "strict_validation_fallback_generated",
+    "strict_validation_fallback_pass",
+})
+
+def template_failure(editor_notes: Any, *, dry_run: bool = False) -> Optional[str]:
+    """Why a draft is a template and not an article, or None. A dry run's
+    synthetic draft is expected and never sent to review anyway."""
+    if dry_run:
+        return None
+    notes = sorted(TEMPLATE_DRAFT_NOTES.intersection(safe_text(n) for n in (editor_notes or [])))
+    return f"template_not_article:{','.join(notes)}" if notes else None
+
+
 TREND_RSS_DEFAULTS = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
@@ -5375,6 +5392,18 @@ Return only JSON.
                         notes = []
                     notes.append("strict_validation_fallback_pass")
                     payload["editor_notes"] = notes
+
+            # A template is not an article. The two fallbacks above write fixed
+            # prose around the headline: one when the model gave nothing usable,
+            # one when its draft failed validation. Sent to review as finished
+            # stories, 29 of the first 30 legend drafts in the queue were
+            # templates (2026-10-29: the model call had been refused with a 403),
+            # and the admin pipeline rated them "every check passed". A template
+            # now fails, so the retry stage writes the story again.
+            template_error = template_failure(payload.get("editor_notes"), dry_run=dry_run)
+            if template_error:
+                valid = False
+                errors = [*errors, template_error]
 
             status = "pending_review" if self.require_human_review else "generated"
             if not valid:

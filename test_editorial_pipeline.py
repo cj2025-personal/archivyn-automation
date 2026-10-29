@@ -143,5 +143,106 @@ class DatabaseNameTests(unittest.TestCase):
         self.assertEqual(resolve_mongo_db_name("mongodb+srv://h/archivyn", client=Broken()), "archivyn")
 
 
+class TemplateDraftTests(unittest.TestCase):
+    """A template is never sent to review (2026-10-29: 29 of the first 30
+    legend drafts in the queue were templates, rated "every check passed")."""
+
+    def test_a_template_draft_fails_and_says_which(self) -> None:
+        import daily_story_worker as worker_module
+
+        error = worker_module.template_failure(["source_url_enforced", "llm_non_json_fallback_generated"])
+        self.assertEqual(error, "template_not_article:llm_non_json_fallback_generated")
+        self.assertIsNotNone(worker_module.template_failure(["strict_validation_fallback_pass"]))
+
+    def test_a_real_draft_or_a_dry_run_is_not_failed(self) -> None:
+        import daily_story_worker as worker_module
+
+        self.assertIsNone(worker_module.template_failure(["json_repair_pass", "reader_sanitized"]))
+        self.assertIsNone(worker_module.template_failure(None))
+        self.assertIsNone(worker_module.template_failure(["llm_non_json_fallback_generated"], dry_run=True))
+
+
+class FakeCollection:
+    def __init__(self, stories):
+        self.stories = stories
+        self.updates = []
+
+    def find(self, _filter):
+        return self
+
+    def sort(self, _order):
+        return self
+
+    def limit(self, _n):
+        return list(self.stories)
+
+    def update_one(self, selector, update):
+        self.updates.append((selector, update))
+
+
+class FakeWorker:
+    model_name = "gemini-test"
+
+    def __init__(self, *args, **kwargs):
+        self.stories_collection = FakeCollection([STORY])
+
+    def close(self):
+        pass
+
+
+STORY = {
+    "_id": "s1",
+    "story_key": "k1",
+    "status": "pending_review",
+    "content": {
+        "title": "Historical Lens on a drone strike",
+        "standfirst": "A strike killed 41 people.",
+        "article_markdown": "## Why This Matters Now\nThe strike [chunk:a] ...",
+    },
+    "trend_issue": {"title": "Drone strike by paramilitary kills 41"},
+    "claim_evidence_map": [{"chunk_ids": ["a"]}],
+}
+
+
+class TopicSuitabilityTests(unittest.TestCase):
+    """Whether a band may meet the story's news at all is ruled on before a
+    version is written; a gentle rewrite of a killing is still a killing."""
+
+    def test_every_band_has_rules(self) -> None:
+        self.assertEqual(set(personalize.TOPIC_SUITABILITY_RULES), set(personalize.GRADE_BANDS))
+
+    def test_a_ruling_is_reused_only_for_the_same_text_and_rules(self) -> None:
+        verdict = {"suitable": False, "reason": "x", "canonical_content_hash": "h1", "policy_version": personalize.TOPIC_POLICY_VERSION}
+        self.assertEqual(personalize.current_topic_verdict({"grade_k_2": verdict}, "grade_k_2", "h1"), verdict)
+        self.assertIsNone(personalize.current_topic_verdict({"grade_k_2": verdict}, "grade_k_2", "h2"))
+        self.assertIsNone(personalize.current_topic_verdict({"grade_k_2": {**verdict, "policy_version": "old"}}, "grade_k_2", "h1"))
+        self.assertIsNone(personalize.current_topic_verdict({}, "grade_k_2", "h1"))
+
+    def test_the_judge_rules_per_band_and_a_band_without_rules_is_never_suitable(self) -> None:
+        with mock.patch.object(personalize, "_call_structured", return_value={"suitable": False, "reason": "A killing is not for this age."}) as call:
+            verdict = personalize.judge_topic_for_band(FakeWorker(), STORY, "grade_k_2", "h1")
+        self.assertFalse(verdict["suitable"])
+        self.assertEqual(verdict["reason"], "A killing is not for this age.")
+        self.assertEqual(verdict["policy_version"], personalize.TOPIC_POLICY_VERSION)
+        self.assertIn("Drone strike by paramilitary kills 41", call.call_args.args[1])
+        with mock.patch.dict(personalize.TOPIC_SUITABILITY_RULES, {}, clear=True):
+            self.assertFalse(personalize.judge_topic_for_band(FakeWorker(), STORY, "grade_k_2", "h1")["suitable"])
+        with mock.patch.object(personalize, "_call_structured", return_value={"reason": "no verdict"}):
+            with self.assertRaises(RuntimeError):
+                personalize.judge_topic_for_band(FakeWorker(), STORY, "grade_k_2", "h1")
+
+    def test_an_unsuitable_band_gets_no_version_and_the_ruling_is_kept(self) -> None:
+        worker = FakeWorker()
+        audience = {"band_keys": ["grade_k_2"]}
+        with mock.patch.object(personalize, "DailyStoryWorker", return_value=worker),                 mock.patch.object(personalize, "resolve_active_audience", return_value=audience),                 mock.patch.object(personalize, "_call_structured", return_value={"suitable": False, "reason": "Not for this age."}) as call:
+            result = personalize.run_personalization(story_date="2026-10-29", max_stories=5, dry_run=False, no_llm=False)
+        self.assertEqual(result["summary"]["not_suitable"], 1)
+        self.assertEqual(call.call_count, 1, "only the ruling: no version was written")
+        update = worker.stories_collection.updates[0][1]["$set"]
+        self.assertEqual([v["status"] for v in update["audience_variants"]], ["not_suitable"])
+        self.assertFalse(update["audience_suitability"]["grade_k_2"]["suitable"])
+        self.assertTrue(update["personalization.ready"], "a band ruled out is settled")
+
+
 if __name__ == "__main__":
     unittest.main()

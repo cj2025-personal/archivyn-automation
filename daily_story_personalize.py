@@ -470,6 +470,124 @@ def _replace_variant(variants: List[Dict[str, Any]], next_variant: Dict[str, Any
     return sorted(filtered, key=lambda item: order.get(safe_text(item.get("band_key")), len(order)))
 
 
+# ── Whether a band may meet the story's news at all ─────────────────────────
+# A legend story answers today's news through a legend's ideas. Whether a band
+# may meet that news is decided by the model, per story, under these rules,
+# before any version is written. The variant verifier judges only how a
+# rewrite is framed, so a drone strike that killed 41 people could be framed
+# gently for kindergarten and pass (2026-10-29). A band the topic does not
+# suit gets no version, and the reader app shows that band nothing.
+TOPIC_POLICY_VERSION = "legend-topic-suitability-v1"
+TOPIC_SUITABILITY_RULES: Dict[str, str] = {
+    "grade_k_2": (
+        "Only what a young child meets in daily life or a picture book: nature, animals, space, "
+        "inventions and how things work, art, music, sport, community helpers, kindness and fairness "
+        "among friends, celebrations. Never war or armed conflict, terrorism, killing or death by "
+        "violence, disasters with casualties, crime, abuse, illness that frightens, political fights "
+        "or elections, or anything frightening."
+    ),
+    "grade_3_5": (
+        "Science and discovery, the environment, health in general terms, inventions, culture, sport, "
+        "and how civic life works (what laws, voting or courts are for), fairness and rights in "
+        "general terms. Not war or armed conflict, terrorism, killings, disasters with casualties, "
+        "crime and violence, graphic illness, or partisan political fights."
+    ),
+    "grade_6_8": (
+        "What a middle-school social studies class discusses: elections and government, human "
+        "rights, climate, migration, the economy, and conflicts explained through causes and "
+        "consequences. Not graphic violence or casualty detail, sexual content, self-harm, or a "
+        "story whose subject is the suffering itself rather than understanding it."
+    ),
+    "grade_9_12": (
+        "Most news a high-school current-events class discusses, war and conflict included, handled "
+        "analytically and without graphic detail. Not sexual content, detailed violence, self-harm "
+        "methods, or content that targets a group of people."
+    ),
+}
+TOPIC_VERDICT_SCHEMA: Dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "suitable": {"type": "BOOLEAN"},
+        "reason": {"type": "STRING"},
+    },
+    "required": ["suitable", "reason"],
+}
+
+
+def topic_prompt(story: Dict[str, Any], band_key: str) -> str:
+    band = GRADE_BANDS[band_key]
+    content = story.get("content") or {}
+    trend = story.get("trend_issue") or {}
+    opening = _strip_markup(content.get("article_markdown"))[:1500]
+    return f"""You decide whether a news topic may be brought to {band['label']} readers (typically
+ages {band['typical_age_min']} to {band['typical_age_max']}) on a children's reading platform, as the subject of
+an article that looks at today's news through a historical scholar's ideas.
+
+Rules for this band:
+{TOPIC_SUITABILITY_RULES[band_key]}
+
+Decide on the topic and what a reader would have to engage with, not on the writing. An article
+can be gentle and still be about something this band should not be given. Return JSON only:
+suitable (true or false) and reason (one sentence a reviewer can read).
+
+News headline it answers: {safe_text(trend.get('title')) or 'none'}
+Article title: {safe_text(content.get('title'))}
+Standfirst: {safe_text(content.get('standfirst'))}
+Opening: {opening}
+"""
+
+
+def judge_topic_for_band(worker: DailyStoryWorker, story: Dict[str, Any], band_key: str, canonical_hash: str) -> Dict[str, Any]:
+    """The model's ruling on one band. A band with no rules is never suitable."""
+    base = {
+        "canonical_content_hash": canonical_hash,
+        "policy_version": TOPIC_POLICY_VERSION,
+        "judged_at": utc_now_iso(),
+    }
+    if band_key not in TOPIC_SUITABILITY_RULES:
+        return {**base, "suitable": False, "reason": "No topic rules for this band.", "judge": "policy"}
+    payload = _call_structured(worker, topic_prompt(story, band_key), TOPIC_VERDICT_SCHEMA, 1200)
+    if not isinstance(payload.get("suitable"), bool):
+        raise RuntimeError("topic judge returned no verdict")
+    return {
+        **base,
+        "suitable": payload["suitable"],
+        "reason": safe_text(payload.get("reason"))[:400],
+        "judge": safe_text(getattr(worker, "model_name", "")) or "vertex",
+    }
+
+
+def current_topic_verdict(suitability: Dict[str, Any], band_key: str, canonical_hash: str) -> Optional[Dict[str, Any]]:
+    """A ruling already made for this story text under these rules, or None."""
+    verdict = suitability.get(band_key)
+    if (
+        isinstance(verdict, dict)
+        and isinstance(verdict.get("suitable"), bool)
+        and verdict.get("canonical_content_hash") == canonical_hash
+        and verdict.get("policy_version") == TOPIC_POLICY_VERSION
+    ):
+        return verdict
+    return None
+
+
+def not_suitable_variant(story: Dict[str, Any], band_key: str, verdict: Dict[str, Any], canonical_hash: str) -> Dict[str, Any]:
+    band = GRADE_BANDS[band_key]
+    return {
+        "band_key": band_key,
+        "band_label": band["label"],
+        "min_grade_level": band["min_level"],
+        "max_grade_level": band["max_level"],
+        "typical_age_min": band["typical_age_min"],
+        "typical_age_max": band["typical_age_max"],
+        "status": "not_suitable",
+        "topic_suitability": verdict,
+        "canonical_content_hash": canonical_hash,
+        "prompt_version": PROMPT_VERSION,
+        "generated_at": utc_now_iso(),
+        "source_story_key": safe_text(story.get("story_key")),
+    }
+
+
 def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_llm: bool, scholar_id: str = "") -> Dict[str, Any]:
     worker = DailyStoryWorker(use_llm=not (dry_run or no_llm), trends_enabled=False)
     try:
@@ -491,6 +609,7 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
             "variants_required": len(stories) * len(audience["band_keys"]),
             "generated": 0,
             "skipped_current": 0,
+            "not_suitable": 0,
             "failed": 0,
         }
         failures: List[Dict[str, str]] = []
@@ -508,7 +627,28 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
             canonical_hash = _content_hash(story)
             variants = list(story.get("audience_variants") or [])
             allowed_ids = {row["evidence_id"] for row in _evidence_rows(story)}
+            suitability = dict(story.get("audience_suitability") or {})
             for band_key in audience["band_keys"]:
+                verdict = current_topic_verdict(suitability, band_key, canonical_hash)
+                if verdict is None:
+                    try:
+                        verdict = judge_topic_for_band(worker, story, band_key, canonical_hash)
+                    except Exception as exc:  # pragma: no cover - external service behavior
+                        # No ruling, no version this run: the reader app serves a
+                        # band only on a ruling that it suits, so nothing is shown
+                        # in the meantime, and the next run asks again.
+                        summary["failed"] += 1
+                        failures.append({
+                            "story_key": safe_text(story.get("story_key")),
+                            "band_key": band_key,
+                            "error": f"topic_suitability_unjudged:{safe_text(exc)}"[:1200],
+                        })
+                        continue
+                    suitability[band_key] = verdict
+                if not verdict["suitable"]:
+                    variants = _replace_variant(variants, not_suitable_variant(story, band_key, verdict, canonical_hash))
+                    summary["not_suitable"] += 1
+                    continue
                 existing = _existing_variant(story, band_key)
                 existing_hash_is_current = bool(
                     existing and existing.get("canonical_content_hash") == canonical_hash
@@ -739,11 +879,13 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                 {"$set": {
                     "audience_contract": audience,
                     "audience_variants": variants,
+                    "audience_suitability": suitability,
                     "personalization.updated_at": utc_now_iso(),
                     "personalization.prompt_version": PROMPT_VERSION,
+                    # Every band settled: written, or ruled unsuitable.
                     "personalization.ready": all(
                         _existing_variant({"audience_variants": variants}, key)
-                        and _existing_variant({"audience_variants": variants}, key).get("status") == "ready"
+                        and _existing_variant({"audience_variants": variants}, key).get("status") in ("ready", "not_suitable")
                         for key in audience["band_keys"]
                     ),
                 }},
