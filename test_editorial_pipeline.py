@@ -12,6 +12,7 @@ Run with:  python -m unittest test_editorial_pipeline
 """
 import os
 import unittest
+from datetime import date
 from unittest import mock
 
 import daily_story_personalize as personalize
@@ -249,6 +250,241 @@ class TopicSuitabilityTests(unittest.TestCase):
         self.assertEqual([v["status"] for v in update["audience_variants"]], ["not_suitable"])
         self.assertFalse(update["audience_suitability"]["grade_k_2"]["suitable"])
         self.assertTrue(update["personalization.ready"], "a band ruled out is settled")
+
+
+def _field(doc, path):
+    for part in path.split("."):
+        if not isinstance(doc, dict):
+            return None
+        doc = doc.get(part)
+    return doc
+
+
+def _matches(doc, query):
+    for path, condition in query.items():
+        value = _field(doc, path)
+        if not isinstance(condition, dict):
+            if value != condition:
+                return False
+            continue
+        for op, arg in condition.items():
+            if op == "$ne":
+                ok = value != arg
+            elif op == "$nin":
+                ok = value not in arg
+            elif op == "$gte":
+                ok = value is not None and value >= arg
+            elif op == "$lt":
+                ok = value is not None and value < arg
+            else:
+                raise NotImplementedError(op)
+            if not ok:
+                return False
+    return True
+
+
+class FakeCursor(list):
+    def sort(self, *_args, **_kwargs):
+        return self
+
+    def limit(self, n):
+        return FakeCursor(self[:n])
+
+
+class FakeMongoCollection:
+    """The query operators the story worker uses, over documents in memory."""
+
+    def __init__(self, docs=()):
+        self.docs = [dict(d) for d in docs]
+
+    def create_index(self, *_args, **_kwargs):
+        pass
+
+    def find(self, query=None, _projection=None):
+        return FakeCursor(d for d in self.docs if _matches(d, query or {}))
+
+    def find_one(self, query=None, _projection=None):
+        found = self.find(query)
+        return found[0] if found else None
+
+    def insert_one(self, doc):
+        self.docs.append(doc)
+
+    def update_one(self, *_args, **_kwargs):
+        pass
+
+
+class FakeDatabase(dict):
+    def __missing__(self, name):
+        self[name] = FakeMongoCollection()
+        return self[name]
+
+
+class FakeMongoClient:
+    def __init__(self, db):
+        self.db = db
+
+    def __getitem__(self, _name):
+        return self.db
+
+    def close(self):
+        pass
+
+
+TODAY = "2026-10-30"
+
+
+def _issue(title, url):
+    import daily_story_worker as worker_module
+
+    return {
+        "title": title,
+        "summary": "",
+        "url": url,
+        "source": url.split("/")[2],
+        "published_at": "2026-10-30T06:00:00+00:00",
+        "tokens": worker_module.DailyStoryWorker._phrase_tokens(title),
+        "text": title,
+    }
+
+
+# One morning's pool, best match first for TOPIC: one event worded by two
+# feeds, then two other events.
+MAZARI_BBC = _issue("Pakistan jails human rights lawyers Imaan Mazari and her husband over posts", "https://www.bbc.co.uk/news/articles/mazari")
+MAZARI_AJ = _issue("Pakistani human rights lawyers Imaan Mazari, husband jailed over posts", "https://www.aljazeera.com/news/mazari")
+VENEZUELA = _issue("Venezuela opposition lawyers challenge election in court", "https://www.nytimes.com/venezuela-election")
+KENYA = _issue("Kenya teachers end strike after pay deal", "https://www.bbc.co.uk/news/articles/kenya")
+POOL = [MAZARI_BBC, MAZARI_AJ, VENEZUELA, KENYA]
+TOPIC = "human rights lawyers courts democracy"
+
+
+def _story(profile_id, story_date, issue=None, title="", status="pending_review"):
+    return {
+        "story_key": f"{profile_id}:{story_date}",
+        "story_date": story_date,
+        "status": status,
+        "scholar": {"profile_id": profile_id},
+        "trend_issue": {"selected": dict(issue or {})},
+        "content": {"title": title or f"A legend on {(issue or {}).get('title', '')}"},
+    }
+
+
+def _story_worker(stories=(), scholars=(), **env):
+    import daily_story_worker as worker_module
+
+    db = FakeDatabase()
+    db["legend_scholar_daily_stories"] = FakeMongoCollection(stories)
+    db["legend_scholars"] = FakeMongoCollection(scholars)
+    settings = {
+        "MONGODB_URI": "mongodb://fake/test",
+        "STORY_ML_ENABLED": "0",
+        "STORY_ENFORCE_PROFILE_QUALITY": "",
+        "STORY_MAX_LEGENDS_PER_EVENT": "",
+        "STORY_TOPIC_REPEAT_WINDOW_DAYS": "",
+        **env,
+    }
+    with mock.patch.dict(os.environ, settings), \
+            mock.patch.object(worker_module, "load_dotenv"), \
+            mock.patch.object(worker_module, "create_mongo_client", return_value=FakeMongoClient(db)), \
+            mock.patch.object(worker_module, "resolve_mongo_db_name", return_value="test"):
+        return worker_module.DailyStoryWorker(use_llm=False, trends_enabled=True)
+
+
+class TrendVarietyTests(unittest.TestCase):
+    """2026-10-29: nearly all ~29 legend drafts were on two news events, some
+    with near identical titles. An event carries at most two legends a day, a
+    legend does not repeat an event within 30 days, and a legend with nothing
+    fresh left sits the day out."""
+
+    def _pick(self, worker, profile_id):
+        fresh, _ = worker._fresh_trend_issues(POOL, profile_id=profile_id, story_date=TODAY)
+        picked = worker._select_trending_issue(TOPIC, fresh)
+        if picked:
+            worker.stories_collection.insert_one(_story(profile_id, TODAY, picked))
+        return picked
+
+    def test_one_feed_s_wording_of_an_event_is_the_same_event(self) -> None:
+        import daily_story_worker as worker_module
+
+        same = worker_module.DailyStoryWorker._same_news_event
+        self.assertTrue(same(MAZARI_BBC, MAZARI_AJ))
+        self.assertTrue(same(MAZARI_BBC, {"title": "Pakistan Sentences Rights Lawyer Imaan Mazari to Prison"}))
+        self.assertFalse(same(MAZARI_BBC, VENEZUELA))
+        self.assertFalse(same(VENEZUELA, KENYA))
+
+    def test_a_day_s_legends_are_spread_at_most_two_to_an_event(self) -> None:
+        self.assertEqual(_story_worker().max_legends_per_event, 2, "the default")
+        # A draft that failed never reached review and holds no place.
+        worker = _story_worker([_story("legend-failed", TODAY, MAZARI_BBC, status="failed_validation")])
+        picks = [self._pick(worker, f"legend-{n}") for n in range(7)]
+        titles = [p["title"] if p else None for p in picks]
+        self.assertEqual(
+            titles,
+            [MAZARI_BBC["title"], MAZARI_BBC["title"], VENEZUELA["title"], VENEZUELA["title"], KENYA["title"], KENYA["title"], None],
+            "the best match until it holds two legends (in any feed's wording), then the next best",
+        )
+
+    def test_the_daily_cap_is_set_by_its_variable(self) -> None:
+        worker = _story_worker([_story("legend-a", TODAY, MAZARI_AJ)], STORY_MAX_LEGENDS_PER_EVENT="1")
+        self.assertEqual(self._pick(worker, "legend-b")["title"], VENEZUELA["title"])
+
+    def test_a_legend_does_not_repeat_an_event_or_a_title_within_the_window(self) -> None:
+        stories = [
+            # The same event in another feed's wording, ten days ago.
+            _story("legend-c", "2026-10-20", {"title": "Pakistan Sentences Rights Lawyer Imaan Mazari to Prison", "url": "https://www.nytimes.com/mazari"}),
+            # A title essentially the same as today's Kenya headline.
+            _story("legend-c", "2026-10-25", title="Kenya's teachers end their strike after a pay deal"),
+            # Older than the window, and a draft that failed: neither counts.
+            _story("legend-c", "2026-09-20", VENEZUELA),
+            _story("legend-c", "2026-10-27", VENEZUELA, status="failed_validation"),
+            # Another legend's history is not this legend's.
+            _story("legend-x", "2026-10-29", VENEZUELA),
+        ]
+        worker = _story_worker(stories)
+        fresh, blocked = worker._fresh_trend_issues(POOL, profile_id="legend-c", story_date=TODAY)
+        self.assertEqual([i["title"] for i in fresh], [VENEZUELA["title"]])
+        self.assertEqual(blocked, {"at_event_cap": 0, "repeats_legend": 3})
+        self.assertEqual(worker._select_trending_issue(TOPIC, fresh)["title"], VENEZUELA["title"])
+
+    def test_a_legend_with_no_fresh_event_is_skipped_with_the_reason(self) -> None:
+        stories = [
+            _story("legend-a", TODAY, MAZARI_BBC),
+            _story("legend-b", TODAY, MAZARI_AJ),
+            _story("legend-d", TODAY, VENEZUELA),
+            _story("legend-e", TODAY, VENEZUELA),
+            _story("legend-c", "2026-10-25", KENYA),
+        ]
+        scholars = [{"profile_id": "legend-c", "professor_name": "Ida B. Wells"}, {"profile_id": "legend-f", "professor_name": "Carter G. Woodson"}]
+        worker = _story_worker(stories, scholars)
+        chunks = [{"chunk_id": f"c{i}", "section": "about", "text": "x"} for i in range(4)]
+        with mock.patch.object(worker, "_fetch_trending_issues", return_value=list(POOL)), \
+                mock.patch.object(worker, "_choose_topic", return_value=(TOPIC, "test", 0)) as choose_topic, \
+                mock.patch.object(worker, "_extract_context_chunks", return_value=chunks), \
+                mock.patch.object(worker, "_build_style_profile", return_value={}), \
+                mock.patch.object(worker, "_collect_allowed_source_urls", return_value=[]), \
+                mock.patch.object(worker, "_select_trending_issue", wraps=worker._select_trending_issue) as select, \
+                mock.patch.object(worker, "_generate_story_payload", side_effect=RuntimeError("no model in tests")):
+            result = worker.run(
+                scholar_id=None,
+                date_value=date(2026, 10, 30),
+                topic_override=None,
+                max_scholars=5,
+                max_context_chunks=12,
+                dry_run=True,
+            )
+
+        self.assertEqual(result["summary"]["skipped_no_fresh_trend"], 1)
+        reason = next(e for e in result["errors"] if e.startswith("legend-c:"))
+        self.assertEqual(
+            reason,
+            "legend-c:skipped_no_fresh_trend:of 4 trend issues, 3 are on events already carried by 2 legends today "
+            "and 1 repeat this legend's stories of the last 30 days",
+        )
+        self.assertEqual(choose_topic.call_count, 1, "only legend-f went on to be written")
+        self.assertEqual(choose_topic.call_args.kwargs["profile_id"], "legend-f")
+        # legend-f is written on the one event still open, not on a full one.
+        self.assertEqual([i["title"] for i in select.call_args.args[1]], [KENYA["title"]])
+        self.assertFalse([s for s in worker.stories_collection.docs if s["story_date"] == TODAY and s["scholar"]["profile_id"] == "legend-c"])
 
 
 if __name__ == "__main__":

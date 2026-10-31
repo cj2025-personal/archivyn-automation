@@ -24,7 +24,7 @@ import uuid
 import warnings
 import xml.etree.ElementTree as ET
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -166,6 +166,30 @@ TREND_RSS_DEFAULTS = [
     "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
     "https://www.aljazeera.com/xml/rss/all.xml",
 ]
+
+# Variety in the news a day's stories are written on. Each legend took the
+# headline that best matched its own topic, with no memory of what the others
+# took or what it had written before: on 2026-10-29 nearly all ~29 drafts were
+# on two events (Venezuela; the jailing of Imaan Mazari), some with near
+# identical titles. An event now carries at most STORY_MAX_LEGENDS_PER_EVENT
+# legends a day, and a legend is not written on an event (or a title
+# essentially the same) it already covered within STORY_TOPIC_REPEAT_WINDOW_DAYS.
+DEFAULT_MAX_LEGENDS_PER_EVENT = 2
+DEFAULT_TOPIC_REPEAT_WINDOW_DAYS = 30
+
+# A story in one of these states never reached review: it neither takes an
+# event's place for the day nor counts as the legend having covered it.
+FAILED_STORY_STATUSES = ("failed_validation", "failed_generation")
+
+# Headline filler that says nothing about which event a story is on.
+EVENT_NOISE_TOKENS = {"says", "amid", "live", "latest", "update", "updates", "report", "reports", "know"}
+
+STORY_EVENT_PROJECTION = {
+    "_id": 0,
+    "trend_issue.selected.title": 1,
+    "trend_issue.selected.url": 1,
+    "content.title": 1,
+}
 
 STYLE_CONNECTORS = [
     "however",
@@ -443,6 +467,14 @@ class DailyStoryWorker:
         self.trend_cache_ttl_hours = int(safe_text(os.getenv("STORY_TREND_CACHE_TTL_HOURS")) or 72)
         rss_urls_env = safe_text(os.getenv("STORY_TREND_RSS_URLS"))
         self.trend_rss_urls = [u.strip() for u in rss_urls_env.split(",") if u.strip()] if rss_urls_env else list(TREND_RSS_DEFAULTS)
+        self.max_legends_per_event = max(
+            1,
+            int(safe_text(os.getenv("STORY_MAX_LEGENDS_PER_EVENT")) or DEFAULT_MAX_LEGENDS_PER_EVENT),
+        )
+        self.topic_repeat_window_days = max(
+            0,
+            int(safe_text(os.getenv("STORY_TOPIC_REPEAT_WINDOW_DAYS")) or DEFAULT_TOPIC_REPEAT_WINDOW_DAYS),
+        )
         self.style_sentence_samples = int(safe_text(os.getenv("STORY_STYLE_SENTENCE_SAMPLES")) or 120)
         env_enforce_quality = (
             safe_text(os.getenv("STORY_ENFORCE_PROFILE_QUALITY")).lower() in {"1", "true", "yes", "on"}
@@ -2123,6 +2155,101 @@ class DailyStoryWorker:
         selected = dict(candidates[best_idx])
         selected["selection_score"] = round(float(best_score), 4)
         return selected
+
+    @staticmethod
+    def _event_tokens(text: Any) -> set:
+        """The words of a headline that say which event it is on, crudely
+        stemmed so that Pakistan/Pakistani and jails/jailed meet."""
+        out = set()
+        for tok in DailyStoryWorker._topic_tokens(safe_text(text)):
+            if tok in EVENT_NOISE_TOKENS:
+                continue
+            for suffix in ("ing", "ed", "s"):
+                if tok.endswith(suffix) and len(tok) - len(suffix) >= 4:
+                    tok = tok[: -len(suffix)]
+                    break
+            out.add(tok[:6])
+        return out
+
+    @staticmethod
+    def _same_news_event(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        """Whether two headlines are on one news event: the same link, or at
+        least two shared headline words making up half the shorter headline.
+        Feeds word one event differently (BBC, NYT and Al Jazeera each ran
+        the Mazari sentencing), so an exact title match is not enough."""
+        url_key = DailyStoryWorker._normalize_url_key(safe_text(a.get("url")))
+        if url_key and url_key == DailyStoryWorker._normalize_url_key(safe_text(b.get("url"))):
+            return True
+        tokens_a = DailyStoryWorker._event_tokens(a.get("title"))
+        tokens_b = DailyStoryWorker._event_tokens(b.get("title"))
+        shared = len(tokens_a & tokens_b)
+        return shared >= 2 and shared * 2 >= min(len(tokens_a), len(tokens_b))
+
+    @staticmethod
+    def _story_events(story: Dict[str, Any]) -> List[Dict[str, str]]:
+        """What a written story is on: the headline it was anchored to, and its own title."""
+        selected = (story.get("trend_issue") or {}).get("selected") or {}
+        events: List[Dict[str, str]] = []
+        if safe_text(selected.get("title")) or safe_text(selected.get("url")):
+            events.append({"title": safe_text(selected.get("title")), "url": safe_text(selected.get("url"))})
+        title = safe_text((story.get("content") or {}).get("title"))
+        if title:
+            events.append({"title": title, "url": ""})
+        return events
+
+    def _fresh_trend_issues(
+        self,
+        issues: List[Dict[str, Any]],
+        *,
+        profile_id: str,
+        story_date: str,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """The trend issues this legend may still be written on for story_date,
+        best-first order kept, and how many were ruled out for each reason.
+
+        Read from the stories already written, so the nightly run, the retry
+        stage and any rerun share one count: an event that other legends
+        already carry max_legends_per_event times that day is out, as is one
+        this legend wrote on (or under an essentially equal title) within the
+        repeat window. Failed stories count for neither."""
+        blocked = {"at_event_cap": 0, "repeats_legend": 0}
+        if not issues:
+            return [], blocked
+
+        live = {"$nin": list(FAILED_STORY_STATUSES)}
+        today = [
+            self._story_events(story)
+            for story in self.stories_collection.find(
+                {"story_date": story_date, "status": live, "scholar.profile_id": {"$ne": profile_id}},
+                STORY_EVENT_PROJECTION,
+            )
+        ]
+        covered_by_legend: List[Dict[str, str]] = []
+        if self.topic_repeat_window_days > 0:
+            window_start = (date.fromisoformat(story_date) - timedelta(days=self.topic_repeat_window_days)).isoformat()
+            for story in self.stories_collection.find(
+                {
+                    "scholar.profile_id": profile_id,
+                    "story_date": {"$gte": window_start, "$lt": story_date},
+                    "status": live,
+                },
+                STORY_EVENT_PROJECTION,
+            ):
+                covered_by_legend.extend(self._story_events(story))
+
+        fresh: List[Dict[str, Any]] = []
+        for issue in issues:
+            if any(self._same_news_event(issue, past) for past in covered_by_legend):
+                blocked["repeats_legend"] += 1
+                continue
+            legends_on_event = sum(
+                1 for events in today if any(self._same_news_event(issue, e) for e in events)
+            )
+            if legends_on_event >= self.max_legends_per_event:
+                blocked["at_event_cap"] += 1
+                continue
+            fresh.append(issue)
+        return fresh, blocked
 
     def _mine_statistical_phrases(
         self,
@@ -5064,6 +5191,8 @@ Return only JSON.
                 "trends_enabled": self.trends_enabled,
                 "trend_provider": self.trend_provider,
                 "trend_region": self.trend_region,
+                "max_legends_per_event": self.max_legends_per_event,
+                "topic_repeat_window_days": self.topic_repeat_window_days,
                 "enforce_profile_quality": self.enforce_profile_quality,
                 "profile_quality_min_score": self.profile_quality_min_score,
                 "strict_reliability": self.strict_reliability,
@@ -5094,6 +5223,7 @@ Return only JSON.
                 "generated": 0,
                 "skipped_existing": 0,
                 "skipped_profile_quality": 0,
+                "skipped_no_fresh_trend": 0,
                 "degraded_no_trend_data": 0,
                 "failed_no_trend_data": 0,
                 "failed_no_context": 0,
@@ -5161,6 +5291,24 @@ Return only JSON.
                 )
                 continue
 
+            # With every event at its daily cap or already covered by this
+            # legend, the legend sits the day out rather than repeat an event.
+            trend_candidates, trends_blocked = self._fresh_trend_issues(
+                trending_issues,
+                profile_id=profile_id,
+                story_date=story_date,
+            )
+            if trending_issues and not trend_candidates:
+                summary["skipped_no_fresh_trend"] += 1
+                all_errors.append(
+                    f"{profile_id}:skipped_no_fresh_trend:of {len(trending_issues)} trend issues, "
+                    f"{trends_blocked['at_event_cap']} are on events already carried by "
+                    f"{self.max_legends_per_event} legends today and "
+                    f"{trends_blocked['repeats_legend']} repeat this legend's stories of the last "
+                    f"{self.topic_repeat_window_days} days"
+                )
+                continue
+
             topic, topic_source, ml_topic_count = self._choose_topic(
                 scholar_doc=scholar_doc,
                 profile_id=profile_id,
@@ -5180,7 +5328,7 @@ Return only JSON.
             allowed_chunk_ids = {c["chunk_id"] for c in context_chunks}
             disclosure = self._build_disclosure(professor_name, self.assume_deceased)
             style_profile = self._build_style_profile(scholar_doc)
-            trend_issue = self._select_trending_issue(topic, trending_issues)
+            trend_issue = self._select_trending_issue(topic, trend_candidates)
             if self.strict_reliability and self.trends_enabled and not trend_issue:
                 if not self.allow_corpus_only_when_no_trend:
                     summary["failed_no_trend_data"] += 1
