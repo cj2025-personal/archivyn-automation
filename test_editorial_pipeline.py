@@ -395,7 +395,43 @@ def _story_worker(stories=(), scholars=(), db=None, **env):
             mock.patch.object(worker_module, "load_dotenv"), \
             mock.patch.object(worker_module, "create_mongo_client", return_value=FakeMongoClient(db)), \
             mock.patch.object(worker_module, "resolve_mongo_db_name", return_value="test"):
-        return worker_module.DailyStoryWorker(use_llm=False, trends_enabled=True)
+        worker = worker_module.DailyStoryWorker(use_llm=False, trends_enabled=True)
+    worker.article_http = FakeHttp()  # never the network
+    return worker
+
+
+class FakeResponse:
+    def __init__(self, status=200, body=b"", headers=None):
+        self.status_code = status
+        self.body = body
+        self.headers = {"Content-Type": "text/html; charset=utf-8"} if headers is None else headers
+        self.bytes_read = 0
+        self.closed = False
+
+    def iter_content(self, chunk_size=1):
+        for start in range(0, len(self.body), chunk_size):
+            piece = self.body[start:start + chunk_size]
+            self.bytes_read += len(piece)
+            yield piece
+
+    def close(self):
+        self.closed = True
+
+
+class FakeHttp:
+    """The article client: answers each URL from pages (a FakeResponse, or an
+    exception to raise), anything else with a 404, and keeps every request."""
+
+    def __init__(self, pages=None):
+        self.pages = dict(pages or {})
+        self.requests = []
+
+    def get(self, url, **kwargs):
+        self.requests.append((url, kwargs))
+        page = self.pages.get(url, FakeResponse(404))
+        if isinstance(page, Exception):
+            raise page
+        return page
 
 
 class TrendVarietyTests(unittest.TestCase):
@@ -669,6 +705,143 @@ class TrendRelevanceJudgeTests(unittest.TestCase):
         [story] = worker.stories_collection.docs
         self.assertEqual(story["trend_issue"]["selected"]["title"], KENYA["title"])
         self.assertEqual(story["trend_issue"]["relevance"]["rating"], "strong")
+
+
+KENYA_PARAGRAPHS = [
+    "Teachers in Kenya returned to classrooms on Monday after their union accepted a 12% pay rise spread over two years.",
+    "The strike, which began on 2 September, closed more than 9,000 public secondary schools across the country’s 47 counties.",
+    "Union secretary general Collins Oyuu said delegates had voted 412 to 37 to accept the offer from the Teachers Service Commission.",
+    "The commission said the agreement would cost 18 billion shillings in its first year and would be paid from January 2027.",
+    "Parents’ groups said pupils had lost six weeks of teaching ahead of national examinations that begin in November.",
+    "The education ministry said a catch-up timetable would add Saturday classes in the worst affected counties until December.",
+]
+
+
+def _article_page(paragraphs=KENYA_PARAGRAPHS, head=""):
+    body = "".join(f"<p>{p}</p>" for p in paragraphs)
+    return (
+        f"<html><head><title>Kenya</title><script>var tracking = 'not article text at all, only a script';</script>{head}</head>"
+        "<body><nav><p>Home, News, Sport, Business, Innovation, Culture, Travel and Earth sections</p></nav>"
+        f"<article><header><h1>Kenya teachers end strike</h1></header>{body}"
+        "<figure><figcaption><p>A caption long enough to pass for a paragraph, which it is not.</p></figcaption></figure>"
+        "</article><footer><p>Copyright 2026. Read about our approach to external linking.</p></footer></body></html>"
+    ).encode("utf-8")
+
+
+class ArticleTextTests(unittest.TestCase):
+    """2026-11-01: the writer had only the feed's title and one line of
+    summary, too thin for concrete details without inventing them. The
+    article's own text is fetched and given to the writer as the grounding
+    for claims about the event; any failure falls back to title and summary."""
+
+    URL = KENYA["url"]
+
+    def _fetch(self, pages, url=URL):
+        worker = _story_worker()
+        worker.article_http = FakeHttp(pages)
+        return worker, worker._with_article_text({**KENYA, "url": url})
+
+    def test_the_article_s_main_text_is_kept_and_fetched_politely(self) -> None:
+        worker, issue = self._fetch({self.URL: FakeResponse(body=_article_page())})
+        self.assertEqual(issue["article_text"], "\n\n".join(KENYA_PARAGRAPHS))
+        self.assertEqual(issue["article_fetch"]["status"], "fetched")
+        self.assertNotIn("fallback", issue["article_fetch"])
+        self.assertEqual(issue["title"], KENYA["title"], "the feed item is otherwise unchanged")
+        [(url, kwargs)] = worker.article_http.requests
+        self.assertIn("ArchivynStoryReader", kwargs["headers"]["User-Agent"])
+        self.assertEqual(kwargs["timeout"], (5, 10))
+        self.assertEqual((kwargs["allow_redirects"], kwargs["stream"]), (False, True))
+
+    def test_the_article_text_is_the_writer_s_grounding_for_the_event(self) -> None:
+        worker, issue = self._fetch({self.URL: FakeResponse(body=_article_page())})
+        chunks = [{"chunk_id": "c1", "section": "about", "text": "x"}]
+        prompt = worker._build_prompt("Derrick Bell", TOPIC, chunks, issue, {}, [], True)
+        self.assertIn(KENYA_PARAGRAPHS[2], prompt)
+        self.assertIn("Ground claims about the current event only in the news article text above", prompt)
+        bare = worker._build_prompt("Derrick Bell", TOPIC, chunks, {**issue, "article_text": "", "article_fetch": {"status": "timeout"}}, {}, [], True)
+        self.assertIn("News article text: not available (timeout).", bare)
+        self.assertIn("Only the headline and summary above are known about the current event", bare)
+
+    def test_a_run_fetches_the_chosen_event_s_article_for_the_writer_and_keeps_it(self) -> None:
+        worker = _story_worker(scholars=[{"profile_id": "legend-0", "professor_name": "Derrick Bell"}])
+        worker.use_llm = True
+        worker.article_http = FakeHttp({self.URL: FakeResponse(body=_article_page())})
+        model = mock.Mock(side_effect=RuntimeError("no model in tests"))
+        _run_day(worker, dry_run=False, _call_structured_json=_fake_judge({KENYA["title"]: "strong"}), _call_llm_json=model)
+        self.assertEqual(model.call_count, 2, "the draft, then the repair pass")
+        for call in model.call_args_list:
+            self.assertIn(KENYA_PARAGRAPHS[0], call.args[0])
+        [story] = worker.stories_collection.docs
+        self.assertEqual(story["trend_issue"]["selected"]["article_text"], "\n\n".join(KENYA_PARAGRAPHS))
+        self.assertEqual(story["trend_issue"]["selected"]["article_fetch"]["status"], "fetched")
+
+    def test_a_failed_fetch_falls_back_to_title_and_summary_with_the_reason(self) -> None:
+        import requests
+
+        paywalled = _article_page(head='<script type="application/ld+json">{"isAccessibleForFree": false}</script>')
+        cases = {
+            "timeout": requests.exceptions.ReadTimeout("read timed out"),
+            "network_error": requests.exceptions.ConnectionError("connection refused"),
+            "paywalled": FakeResponse(body=paywalled),
+            "too_short": FakeResponse(body=_article_page(KENYA_PARAGRAPHS[:2])),
+            "not_html": FakeResponse(body=b"%PDF-1.7", headers={"Content-Type": "application/pdf"}),
+            "http_error": FakeResponse(403, body=b"Forbidden"),
+        }
+        for status, page in cases.items():
+            _, issue = self._fetch({self.URL: page})
+            self.assertEqual(issue["article_text"], "", status)
+            self.assertEqual(issue["article_fetch"]["status"], status)
+            self.assertEqual(issue["article_fetch"]["fallback"], "title_and_summary")
+            self.assertTrue(issue["article_fetch"]["detail"], status)
+
+    def test_redirects_are_followed_a_few_times_and_only_to_the_web(self) -> None:
+        moved = "https://www.bbc.com/news/articles/kenya"
+        worker, issue = self._fetch({
+            self.URL: FakeResponse(301, headers={"Location": moved}),
+            moved: FakeResponse(body=_article_page()),
+        })
+        self.assertEqual((issue["article_fetch"]["status"], issue["article_fetch"]["final_url"]), ("fetched", moved))
+        _, issue = self._fetch({self.URL: FakeResponse(302, headers={"Location": "file:///etc/passwd"})})
+        self.assertEqual(issue["article_fetch"]["status"], "refused_scheme")
+        hops = {f"https://example.org/{n}": FakeResponse(302, headers={"Location": f"/{n + 1}"}) for n in range(10)}
+        worker, issue = self._fetch(hops, url="https://example.org/0")
+        self.assertEqual(issue["article_fetch"]["status"], "too_many_redirects")
+        self.assertEqual(len(worker.article_http.requests), 4, "the first request and three redirects")
+
+    def test_only_http_and_https_links_to_the_public_web_are_fetched(self) -> None:
+        for url in ("ftp://example.org/a.html", "file:///etc/passwd", "javascript:alert(1)", "//example.org/a"):
+            worker, issue = self._fetch({}, url=url)
+            self.assertEqual(issue["article_fetch"]["status"], "refused_scheme", url)
+            self.assertEqual(worker.article_http.requests, [], url)
+        for url in ("http://169.254.169.254/computeMetadata/v1/", "http://metadata.google.internal/", "http://localhost:8080/", "http://10.0.0.7/a"):
+            worker, issue = self._fetch({}, url=url)
+            self.assertEqual(issue["article_fetch"]["status"], "refused_host", url)
+            self.assertEqual(worker.article_http.requests, [], url)
+        worker, issue = self._fetch({self.URL: FakeResponse(302, headers={"Location": "http://127.0.0.1/admin"})})
+        self.assertEqual((issue["article_fetch"]["status"], len(worker.article_http.requests)), ("refused_host", 1))
+
+    def test_the_size_cap_stops_the_read_and_the_text_is_trimmed(self) -> None:
+        import daily_story_worker as worker_module
+
+        self.assertEqual(worker_module.ARTICLE_MAX_BYTES, 3_000_000)
+        big = FakeResponse(body=_article_page(KENYA_PARAGRAPHS * 400))
+        with mock.patch.object(worker_module, "ARTICLE_MAX_BYTES", 100_000):
+            _, issue = self._fetch({self.URL: big})
+        self.assertGreater(len(big.body), 200_000)
+        self.assertEqual(issue["article_fetch"]["status"], "too_large")
+        self.assertLessEqual(big.bytes_read, 100_000 + 65536, "reading stopped at the cap")
+        self.assertTrue(big.closed)
+        declared = FakeResponse(body=b"<html></html>", headers={"Content-Type": "text/html", "Content-Length": "50000000"})
+        _, issue = self._fetch({self.URL: declared})
+        self.assertEqual((issue["article_fetch"]["status"], declared.bytes_read), ("too_large", 0))
+        # A long article is kept to ARTICLE_TEXT_MAX_CHARS, cut at a paragraph.
+        long_page = [f"{p} (Part {n}.)" for n in range(12) for p in KENYA_PARAGRAPHS]
+        _, issue = self._fetch({self.URL: FakeResponse(body=_article_page(long_page))})
+        text = issue["article_text"]
+        self.assertTrue(issue["article_fetch"]["truncated"])
+        self.assertLessEqual(len(text), worker_module.ARTICLE_TEXT_MAX_CHARS)
+        self.assertGreater(len(text), worker_module.ARTICLE_TEXT_MAX_CHARS - 200)
+        self.assertTrue(text.endswith(".)"), "cut at a paragraph's end")
 
 
 class PersonaCheckTests(unittest.TestCase):

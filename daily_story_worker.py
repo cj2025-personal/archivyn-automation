@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -28,10 +29,20 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import quote_plus, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
+
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None  # type: ignore
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore
 
 from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
 
@@ -220,6 +231,42 @@ TREND_RELEVANCE_SCHEMA: Dict[str, Any] = {
     },
     "required": ["ratings"],
 }
+
+# The news article a story is written on, not only its feed entry. The writer
+# had the RSS title and a line of summary, too thin to give concrete details
+# without inventing them. The selected item's page is fetched politely (an
+# identifying User-Agent, short timeouts, http(s) only, few redirects, a size
+# cap), its main text extracted and kept on the story as
+# trend_issue.selected.article_text, and given to the writer as the grounding
+# for claims about the event. Any failure falls back to title and summary,
+# with the reason in trend_issue.selected.article_fetch.
+ARTICLE_USER_AGENT = "ArchivynStoryReader/1.0 (reads the one news article each daily legend story is written on)"
+ARTICLE_CONNECT_TIMEOUT_SECONDS = 5
+ARTICLE_READ_TIMEOUT_SECONDS = 10
+ARTICLE_TOTAL_SECONDS = 25
+ARTICLE_MAX_REDIRECTS = 3
+ARTICLE_MAX_BYTES = 3_000_000
+ARTICLE_TEXT_MAX_CHARS = 8000
+ARTICLE_TEXT_MIN_CHARS = 600
+ARTICLE_MIN_PARAGRAPH_CHARS = 40
+ARTICLE_HTML_TYPES = ("text/html", "application/xhtml+xml")
+ARTICLE_NOISE_TAGS = (
+    "script", "style", "noscript", "template", "svg", "iframe", "button",
+    "nav", "header", "footer", "aside", "figure", "figcaption",
+)
+# A publisher's own statement (schema.org) that the article is not free to read.
+ARTICLE_PAYWALL_PATTERN = re.compile(rb'"isAccessibleForFree"\s*:\s*"?false', flags=re.I)
+
+
+class ArticleFetchError(Exception):
+    """Why an article's text was not used: status is the short reason kept
+    on the story, detail the specifics."""
+
+    def __init__(self, status: str, detail: str = "") -> None:
+        super().__init__(f"{status}:{detail}" if detail else status)
+        self.status = status
+        self.detail = detail
+
 
 STYLE_CONNECTORS = [
     "however",
@@ -530,6 +577,9 @@ class DailyStoryWorker:
         )
         self.relevance_collection = self.db["daily_story_trend_relevance"]
         self._relevance_cache: Dict[str, Dict[str, Any]] = {}
+        # The HTTP client for news article pages (a requests.Session, made on
+        # first use); see _fetch_article_text.
+        self.article_http: Any = None
         self.style_sentence_samples = int(safe_text(os.getenv("STORY_STYLE_SENTENCE_SAMPLES")) or 120)
         env_enforce_quality = (
             safe_text(os.getenv("STORY_ENFORCE_PROFILE_QUALITY")).lower() in {"1", "true", "yes", "on"}
@@ -661,6 +711,11 @@ class DailyStoryWorker:
     def close(self) -> None:
         try:
             self.mongo_client.close()
+        except Exception:
+            pass
+        try:
+            if self.article_http is not None:
+                self.article_http.close()
         except Exception:
             pass
 
@@ -1857,6 +1912,150 @@ class DailyStoryWorker:
         return text
 
     @staticmethod
+    def _is_internal_host(host: str) -> bool:
+        """A host a feed's link must not send the worker to: this machine,
+        a private or link-local address (the cloud metadata server), or an
+        internal name."""
+        host = safe_text(host).strip("[]").lower()
+        if not host:
+            return True
+        if host == "localhost" or host.endswith((".localhost", ".internal", ".local")):
+            return True
+        try:
+            return not ipaddress.ip_address(host).is_global
+        except ValueError:
+            return False
+
+    def _get_article_page(self, url: str) -> Tuple[bytes, str, str]:
+        """The page at url as (body, content type, final url). Follows at most
+        ARTICLE_MAX_REDIRECTS redirects, each to http(s) only, and reads at
+        most ARTICLE_MAX_BYTES within ARTICLE_TOTAL_SECONDS. Raises
+        ArticleFetchError, or the HTTP client's error on a network failure."""
+        if self.article_http is None:
+            if requests is None:
+                raise ArticleFetchError("client_unavailable", "requests is not installed")
+            self.article_http = requests.Session()
+        started = time.monotonic()
+        current = url
+        for _ in range(ARTICLE_MAX_REDIRECTS + 1):
+            parts = urlparse(current)
+            if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+                raise ArticleFetchError("refused_scheme", current[:160])
+            if self._is_internal_host(parts.hostname or ""):
+                raise ArticleFetchError("refused_host", safe_text(parts.hostname))
+            response = self.article_http.get(
+                current,
+                headers={"User-Agent": ARTICLE_USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+                timeout=(ARTICLE_CONNECT_TIMEOUT_SECONDS, ARTICLE_READ_TIMEOUT_SECONDS),
+                stream=True,
+                allow_redirects=False,
+            )
+            try:
+                status = int(response.status_code)
+                if status in (301, 302, 303, 307, 308):
+                    location = safe_text(response.headers.get("Location"))
+                    if not location:
+                        raise ArticleFetchError("http_error", f"HTTP {status} without a Location")
+                    current = urljoin(current, location)
+                    continue
+                if status != 200:
+                    raise ArticleFetchError("http_error", f"HTTP {status}")
+                content_type = safe_text(response.headers.get("Content-Type")).lower()
+                if not content_type.startswith(ARTICLE_HTML_TYPES):
+                    raise ArticleFetchError("not_html", content_type or "no content type")
+                declared = safe_text(response.headers.get("Content-Length"))
+                if declared.isdigit() and int(declared) > ARTICLE_MAX_BYTES:
+                    raise ArticleFetchError("too_large", f"{declared} bytes declared")
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    body.extend(chunk or b"")
+                    if len(body) > ARTICLE_MAX_BYTES:
+                        raise ArticleFetchError("too_large", f"over {ARTICLE_MAX_BYTES} bytes")
+                    if time.monotonic() - started > ARTICLE_TOTAL_SECONDS:
+                        raise ArticleFetchError("timeout", f"over {ARTICLE_TOTAL_SECONDS}s in all")
+                return bytes(body), content_type, current
+            finally:
+                response.close()
+        raise ArticleFetchError("too_many_redirects", f"more than {ARTICLE_MAX_REDIRECTS}")
+
+    @staticmethod
+    def _extract_article_text(body: bytes, content_type: str) -> str:
+        """The article's main text: the paragraphs of its articleBody,
+        <article> or <main> element (whichever holds the most paragraph text),
+        page furniture removed. Raises ArticleFetchError("paywalled") when the
+        publisher marks the article as not free to read."""
+        if ARTICLE_PAYWALL_PATTERN.search(body):
+            raise ArticleFetchError("paywalled", "the page says isAccessibleForFree: false")
+        if BeautifulSoup is None:
+            raise ArticleFetchError("client_unavailable", "beautifulsoup4 is not installed")
+        charset = re.search(r"charset=([\w.:-]+)", content_type)
+        soup = BeautifulSoup(body, "html.parser", from_encoding=charset.group(1) if charset else None)
+        for tag in soup.find_all(list(ARTICLE_NOISE_TAGS)):
+            tag.decompose()
+        containers = (
+            soup.select('[itemprop="articleBody"]')
+            or soup.find_all("article")
+            or soup.find_all("main")
+            or [soup.body or soup]
+        )
+
+        def paragraphs(node: Any) -> List[str]:
+            found: Dict[str, None] = {}
+            for p in node.find_all("p"):
+                text = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()
+                if len(text) >= ARTICLE_MIN_PARAGRAPH_CHARS:
+                    found.setdefault(text)
+            return list(found)
+
+        best = max((paragraphs(c) for c in containers), key=lambda ps: sum(len(p) for p in ps), default=[])
+        return "\n\n".join(best)
+
+    def _fetch_article_text(self, url: str) -> Dict[str, Any]:
+        """The main text of the news article at url, or why there is none:
+        {"status": "fetched", "text", "chars", "truncated", "final_url"} or
+        {"status": <reason>, "detail"}. Never raises."""
+        url = safe_text(url)
+        if not url:
+            return {"status": "no_link", "detail": "the trend item has no link"}
+        try:
+            body, content_type, final_url = self._get_article_page(url)
+            text = self._extract_article_text(body, content_type)
+        except ArticleFetchError as exc:
+            return {"status": exc.status, "detail": exc.detail[:200]}
+        except Exception as exc:
+            timed_out = isinstance(exc, TimeoutError) or (
+                requests is not None and isinstance(exc, requests.exceptions.Timeout)
+            )
+            detail = re.sub(r"\s+", " ", f"{type(exc).__name__}: {exc}")[:200]
+            return {"status": "timeout" if timed_out else "network_error", "detail": detail}
+        if len(text) < ARTICLE_TEXT_MIN_CHARS:
+            return {
+                "status": "too_short",
+                "detail": f"{len(text)} characters of article text (paywall, or a page drawn by script)",
+                "final_url": final_url,
+            }
+        truncated = len(text) > ARTICLE_TEXT_MAX_CHARS
+        if truncated:
+            cut = text[:ARTICLE_TEXT_MAX_CHARS]
+            boundary = cut.rfind("\n\n")
+            if boundary < ARTICLE_TEXT_MAX_CHARS // 2:
+                boundary = cut.rfind(" ")
+            text = cut[:boundary].rstrip() if boundary > 0 else cut
+        return {"status": "fetched", "text": text, "chars": len(text), "truncated": truncated, "final_url": final_url}
+
+    def _with_article_text(self, issue: Dict[str, Any]) -> Dict[str, Any]:
+        """A copy of the selected trend item carrying its article's text
+        (empty when not fetched) and article_fetch: the status, and when it
+        is not "fetched", why the writer falls back to title and summary."""
+        result = self._fetch_article_text(safe_text(issue.get("url")))
+        out = dict(issue)
+        out["article_text"] = result.pop("text", "")
+        if result["status"] != "fetched":
+            result["fallback"] = "title_and_summary"
+        out["article_fetch"] = {**result, "fetched_at": utc_now_iso()}
+        return out
+
+    @staticmethod
     def _parse_any_datetime(value: str) -> Optional[datetime]:
         text = safe_text(value)
         if not text:
@@ -3051,6 +3250,24 @@ Today's events:
         trend_source = safe_text((trend_issue or {}).get("source")) or "none"
         trend_published_at = safe_text((trend_issue or {}).get("published_at")) or "unknown"
         trend_url = safe_text((trend_issue or {}).get("url")) or "none"
+        article_text = safe_text((trend_issue or {}).get("article_text"))[:ARTICLE_TEXT_MAX_CHARS]
+        if article_text:
+            event_grounding = (
+                "News article text (from reference_url; the source for every claim about the event):\n"
+                f'"""\n{article_text}\n"""'
+            )
+            event_rule = (
+                "Ground claims about the current event only in the news article text above: its facts, figures, "
+                "names, dates and quotes, and no others."
+            )
+        else:
+            article_fetch = (trend_issue or {}).get("article_fetch") or {}
+            why = safe_text(article_fetch.get("status")) if isinstance(article_fetch, dict) else ""
+            event_grounding = f"News article text: not available ({why or 'not fetched'})."
+            event_rule = (
+                "Only the headline and summary above are known about the current event: do not add figures, "
+                "names, dates or quotes about it."
+            )
         style_cadence = safe_text(style_profile.get("cadence")) or "measured"
         style_avg_words = safe_text(style_profile.get("avg_sentence_words")) or "22"
         style_connectors = ", ".join(style_profile.get("connectors") or [])
@@ -3079,6 +3296,8 @@ Current world issue to address:
 - published_at: {trend_published_at}
 - reference_url: {trend_url}
 
+{event_grounding}
+
 Style profile inferred from scholar corpus:
 - cadence: {style_cadence}
 - average sentence length: {style_avg_words} words
@@ -3097,7 +3316,8 @@ Safety and style rules:
 3. Keep a close stylistic resemblance to the scholar's argumentative method and tone.
 4. Use no first-person pronouns at all (never use: I, me, my, mine, we, our, us).
 5. Connect the current issue to historical patterns from the scholar corpus.
-6. Ground all factual claims in the provided context chunks.
+6. Ground all factual claims about the scholar and history in the provided context chunks.
+6b. {event_rule}
 7. Include inline citations in article_markdown as [chunk:CHUNK_ID] and use only allowed chunk IDs.
 7b. Do not use bare bracket IDs like [123e4567-...]; always include the `chunk:` prefix.
 8. Include at least 4 unique chunk citations.
@@ -5674,6 +5894,9 @@ Return only JSON.
             # The event holds this legend's place from here on, even if the
             # draft fails, so the legends after it are spread across events.
             self._record_event_pick(story_date=story_date, profile_id=profile_id, issue=trend_issue)
+            if trend_issue:
+                # The article itself, as the writer's grounding for the event.
+                trend_issue = self._with_article_text(trend_issue)
             if self.strict_reliability and self.trends_enabled and not trend_issue:
                 if not self.allow_corpus_only_when_no_trend:
                     summary["failed_no_trend_data"] += 1
