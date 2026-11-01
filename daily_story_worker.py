@@ -3023,6 +3023,45 @@ Today's events:
         cursor = self.scholars_collection.find({}).limit(max_scholars)
         return list(cursor)
 
+    def _story_candidates(self, story_date: str, max_scholars: int) -> Tuple[List[Dict[str, Any]], int]:
+        """The legends a run writes for, and how many the profile-quality gate
+        kept out.
+
+        A run once took the first max_scholars legends in collection order,
+        ready or not, so every night the same 25 were tried: on 2026-11-01, 19
+        of them were blocked by the gate while 23 ready legends further down
+        were never reached. Now only legends that pass the gate are candidates,
+        the least recently written first (a story that failed does not count
+        as written), with ties in an order that changes from day to day.
+        """
+        excluded = 0
+        eligible: List[Tuple[str, Any]] = []
+        for doc in self.scholars_collection.find({}, {"_id": 1, "profile_id": 1, "daily_story_profile": 1}):
+            profile_id = self._profile_id(doc)
+            if not profile_id:
+                continue
+            ready, _, _ = self._profile_quality_state(doc)
+            if ready:
+                eligible.append((profile_id, doc["_id"]))
+            else:
+                excluded += 1
+
+        last_written: Dict[str, str] = {}
+        for row in self.stories_collection.aggregate([
+            {"$match": {"status": {"$nin": list(FAILED_STORY_STATUSES)}}},
+            {"$group": {"_id": "$scholar.profile_id", "last": {"$max": "$story_date"}}},
+        ]):
+            last_written[safe_text(row.get("_id"))] = safe_text(row.get("last"))
+
+        def turn(item: Tuple[str, Any]) -> Tuple[str, str]:
+            profile_id = item[0]
+            shuffle = hashlib.sha256(f"{story_date}:{profile_id}".encode("utf-8")).hexdigest()
+            return last_written.get(profile_id, ""), shuffle
+
+        chosen = sorted(eligible, key=turn)[:max_scholars]
+        docs = [self.scholars_collection.find_one({"_id": _id}) for _, _id in chosen]
+        return [doc for doc in docs if doc], excluded
+
     def _extract_context_chunks(
         self,
         scholar_doc: Dict[str, Any],
@@ -5781,21 +5820,28 @@ Return only JSON.
         }
         self.jobs_collection.insert_one(run_doc)
 
-        scholars = list(self._iter_scholars(scholar_id=scholar_id, max_scholars=max_scholars))
+        excluded_for_quality = 0
+        if scholar_id:
+            scholars = list(self._iter_scholars(scholar_id=scholar_id, max_scholars=max_scholars))
+        else:
+            scholars, excluded_for_quality = self._story_candidates(story_date, max_scholars)
         if not scholars:
+            error = "no_ready_scholars" if excluded_for_quality else "no_scholars_found"
             self.jobs_collection.update_one(
                 {"run_id": run_id},
                 {
                     "$set": {
                         "ended_at": utc_now_iso(),
                         "status": "failed",
-                        "errors": ["no_scholars_found"],
+                        "summary.skipped_profile_quality": excluded_for_quality,
+                        "errors": [error],
                     }
                 },
             )
-            return {"run_id": run_id, "status": "failed", "error": "no_scholars_found"}
+            return {"run_id": run_id, "status": "failed", "error": error}
 
         summary = run_doc["summary"]
+        summary["skipped_profile_quality"] = excluded_for_quality
         all_errors: List[str] = []
         trending_issues = self._fetch_trending_issues()
         self.jobs_collection.update_one(

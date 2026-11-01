@@ -296,7 +296,9 @@ class FakeMongoCollection:
     """The query operators the story worker uses, over documents in memory."""
 
     def __init__(self, docs=()):
-        self.docs = [dict(d) for d in docs]
+        self.docs = []
+        for doc in docs:
+            self.insert_one(dict(doc))
 
     def create_index(self, *_args, **_kwargs):
         pass
@@ -309,6 +311,7 @@ class FakeMongoCollection:
         return found[0] if found else None
 
     def insert_one(self, doc):
+        doc.setdefault("_id", f"oid-{len(self.docs)}")  # as the driver does
         self.docs.append(doc)
 
     def update_one(self, query, update, upsert=False):
@@ -318,6 +321,28 @@ class FakeMongoCollection:
                 return
         if upsert:
             self.docs.append({**query, **update.get("$set", {})})
+
+    def aggregate(self, pipeline):
+        """$match, then $group on one field with $max: as the worker uses them."""
+        docs = list(self.docs)
+        for stage in pipeline:
+            if "$match" in stage:
+                docs = [d for d in docs if _matches(d, stage["$match"])]
+                continue
+            spec = dict(stage["$group"])
+            key = spec.pop("_id").lstrip("$")
+            groups = {}
+            for d in docs:
+                row = groups.setdefault(_field(d, key), {"_id": _field(d, key)})
+                for name, accumulator in spec.items():
+                    ((op, path),) = accumulator.items()
+                    if op != "$max":
+                        raise NotImplementedError(op)
+                    value = _field(d, path.lstrip("$"))
+                    if value is not None and (row.get(name) is None or value > row[name]):
+                        row[name] = value
+            docs = list(groups.values())
+        return iter(docs)
 
 
 class FakeDatabase(dict):
@@ -589,6 +614,73 @@ class RunEventCapTests(unittest.TestCase):
         # A legend's own pick holds no place against it, and a pick is for its day only.
         self.assertEqual(len(worker._fresh_trend_issues(POOL, profile_id="legend-b", story_date=TODAY)[0]), 4)
         self.assertEqual(len(worker._fresh_trend_issues(POOL, profile_id="legend-c", story_date="2026-10-31")[0]), 4)
+
+
+def _legend(profile_id, status=None, score=0):
+    doc = {"profile_id": profile_id, "professor_name": profile_id.replace("-", " ").title()}
+    if status:
+        doc["daily_story_profile"] = {"status": status, "quality_score": score}
+    return doc
+
+
+class StoryCandidateTests(unittest.TestCase):
+    """2026-11-01: a run took the first 25 legends in collection order, ready
+    or not; 19 of those were blocked by the profile-quality gate every night
+    while 23 ready legends further down were never tried. A run's candidates
+    are the legends that pass the gate, least recently written first."""
+
+    def _candidates(self, worker, story_date=TODAY, max_scholars=25):
+        docs, excluded = worker._story_candidates(story_date, max_scholars)
+        return [d["profile_id"] for d in docs], excluded
+
+    def test_blocked_legends_take_no_place_and_ready_ones_past_the_limit_are_reached(self) -> None:
+        scholars = [_legend(f"blocked-{n}", "needs_data_repair", 20) for n in range(3)]
+        scholars += [_legend(f"ready-{n}", "ready", 74) for n in range(3)]
+        worker = _story_worker(scholars=scholars, STORY_ENFORCE_PROFILE_QUALITY="1")
+        ids, excluded = self._candidates(worker, max_scholars=2)
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(all(i.startswith("ready-") for i in ids), ids)
+        self.assertEqual(excluded, 3)
+        # Below the minimum score is not ready, whatever the status says.
+        worker = _story_worker(scholars=[_legend("low", "ready", 40)], STORY_ENFORCE_PROFILE_QUALITY="1")
+        self.assertEqual(self._candidates(worker), ([], 1))
+
+    def test_a_quality_record_counts_when_the_legend_carries_none(self) -> None:
+        worker = _story_worker(scholars=[_legend("recorded"), _legend("unscored")], STORY_ENFORCE_PROFILE_QUALITY="1")
+        worker.profile_quality_collection.insert_one({"profile_id": "recorded", "status": "ready", "quality_score": 84})
+        self.assertEqual(self._candidates(worker), (["recorded"], 1))
+
+    def test_without_the_gate_every_legend_is_a_candidate(self) -> None:
+        scholars = [_legend("blocked", "needs_data_repair", 20), _legend("unscored")]
+        ids, excluded = self._candidates(_story_worker(scholars=scholars))
+        self.assertEqual((sorted(ids), excluded), (["blocked", "unscored"], 0))
+
+    def test_the_least_recently_written_go_first_and_a_failed_draft_is_not_written(self) -> None:
+        stories = [
+            _story("recent", "2026-10-29"),
+            _story("older", "2026-10-20"),
+            _story("older", "2026-10-01"),
+            _story("only-failed", "2026-10-29", status="failed_validation"),
+            _story("only-failed", "2026-10-28", status="failed_generation"),
+        ]
+        scholars = [_legend(p, "ready", 74) for p in ("recent", "older", "never", "only-failed")]
+        worker = _story_worker(stories, scholars, STORY_ENFORCE_PROFILE_QUALITY="1")
+        ids, _ = self._candidates(worker)
+        self.assertEqual(sorted(ids[:2]), ["never", "only-failed"])
+        self.assertEqual(ids[2:], ["older", "recent"])
+        self.assertEqual(self._candidates(worker, max_scholars=3)[0][2], "older")
+
+    def test_ties_are_ordered_afresh_each_day_and_the_same_within_a_day(self) -> None:
+        worker = _story_worker(scholars=[_legend(f"legend-{n}", "ready", 74) for n in range(12)], STORY_ENFORCE_PROFILE_QUALITY="1")
+        first, _ = self._candidates(worker, "2026-11-01")
+        self.assertEqual(self._candidates(worker, "2026-11-01")[0], first)
+        self.assertNotEqual(self._candidates(worker, "2026-11-02")[0], first)
+        self.assertEqual(sorted(first), sorted(f"legend-{n}" for n in range(12)))
+
+    def test_a_night_with_no_ready_legend_says_so(self) -> None:
+        worker = _story_worker(scholars=[_legend("blocked", "needs_data_repair", 20)], STORY_ENFORCE_PROFILE_QUALITY="1")
+        result = _run_day(worker)
+        self.assertEqual((result["status"], result["error"]), ("failed", "no_ready_scholars"))
 
 
 def _fake_judge(ratings_by_title, *, failing_legends=()):
