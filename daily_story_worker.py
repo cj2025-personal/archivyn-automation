@@ -172,11 +172,41 @@ def template_failure(editor_notes: Any, *, dry_run: bool = False) -> Optional[st
     return f"template_not_article:{','.join(notes)}" if notes else None
 
 
-TREND_RSS_DEFAULTS = [
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-    "https://www.aljazeera.com/xml/rss/all.xml",
-]
+# Publishers whose terms do not allow this pipeline's use of their content:
+# their feeds and pages are for personal, non-commercial use, and automated
+# collection or use with AI systems needs their written permission. The New
+# York Times' terms (effective 2026-01-20) name "grounding" an AI system and
+# "retrieval-augmented generation"; Al Jazeera's bar text and data mining and
+# scraping; the BBC requires permission for AI use. The three default feeds
+# were theirs (BBC World, NYT World, Al Jazeera); on 2026-11-01 they were
+# removed pending legal review. Their items never enter the trend pool,
+# whichever feed or provider brings them and including items already cached,
+# and their pages are never fetched, a redirect to one included.
+EXCLUDED_PUBLISHER_DOMAINS = (
+    "nytimes.com",
+    "bbc.co.uk",
+    "bbc.com",
+    "bbci.co.uk",
+    "aljazeera.com",
+    "aljazeera.net",
+)
+
+# No default feeds until sources are chosen whose licences allow this use
+# (STORY_TREND_RSS_URLS names feeds explicitly).
+TREND_RSS_DEFAULTS: List[str] = []
+
+
+def excluded_publisher(*locations: Any) -> bool:
+    """Whether any of these (a link, or a bare host such as an item's source)
+    belongs to a publisher in EXCLUDED_PUBLISHER_DOMAINS."""
+    for location in locations:
+        text = safe_text(location).lower()
+        if not text:
+            continue
+        host = (urlparse(text).hostname or "") if "://" in text else text.split("/")[0].split(":")[0]
+        if any(host == domain or host.endswith("." + domain) for domain in EXCLUDED_PUBLISHER_DOMAINS):
+            return True
+    return False
 
 # Variety in the news a day's stories are written on. Each legend took the
 # headline that best matched its own topic, with no memory of what the others
@@ -1943,6 +1973,8 @@ class DailyStoryWorker:
                 raise ArticleFetchError("refused_scheme", current[:160])
             if self._is_internal_host(parts.hostname or ""):
                 raise ArticleFetchError("refused_host", safe_text(parts.hostname))
+            if excluded_publisher(current):
+                raise ArticleFetchError("not_permitted", f"{safe_text(parts.hostname)}: the publisher's terms do not allow this use")
             response = self.article_http.get(
                 current,
                 headers={"User-Agent": ARTICLE_USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
@@ -2251,6 +2283,8 @@ class DailyStoryWorker:
         deduped: List[Dict[str, Any]] = []
         seen = set()
         for issue in issues:
+            if excluded_publisher(issue.get("url"), issue.get("source")):
+                continue
             key = self._trend_issue_key(issue)
             if key in seen:
                 continue
@@ -2314,13 +2348,14 @@ class DailyStoryWorker:
             elif p == "gdelt":
                 issues.extend(self._fetch_trends_gdelt())
 
+        issues = [i for i in issues if not excluded_publisher(i.get("url"), i.get("source"))]
         if not issues:
             return []
 
         deduped: List[Dict[str, Any]] = []
         seen = set()
         for issue in issues:
-            norm_title = re.sub(r"\s+", " ", safe_text(issue.get("title")).lower()).strip()
+            norm_title =re.sub(r"\s+", " ", safe_text(issue.get("title")).lower()).strip()
             key = hashlib.sha1(norm_title.encode("utf-8")).hexdigest()[:16]
             if key in seen:
                 continue

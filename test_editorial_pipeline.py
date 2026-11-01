@@ -380,11 +380,12 @@ def _issue(title, url):
 
 
 # One morning's pool, best match first for TOPIC: one event worded by two
-# feeds, then two other events.
-MAZARI_BBC = _issue("Pakistan jails human rights lawyers Imaan Mazari and her husband over posts", "https://www.bbc.co.uk/news/articles/mazari")
-MAZARI_AJ = _issue("Pakistani human rights lawyers Imaan Mazari, husband jailed over posts", "https://www.aljazeera.com/news/mazari")
-VENEZUELA = _issue("Venezuela opposition lawyers challenge election in court", "https://www.nytimes.com/venezuela-election")
-KENYA = _issue("Kenya teachers end strike after pay deal", "https://www.bbc.co.uk/news/articles/kenya")
+# feeds, then two other events. (Example publishers: the real ones these
+# headlines came from are excluded from the pool; see EXCLUDED_PUBLISHER_DOMAINS.)
+MAZARI_BBC = _issue("Pakistan jails human rights lawyers Imaan Mazari and her husband over posts", "https://world.example-news.org/articles/mazari")
+MAZARI_AJ = _issue("Pakistani human rights lawyers Imaan Mazari, husband jailed over posts", "https://www.example-wire.com/news/mazari")
+VENEZUELA = _issue("Venezuela opposition lawyers challenge election in court", "https://daily.example-times.org/venezuela-election")
+KENYA = _issue("Kenya teachers end strike after pay deal", "https://world.example-news.org/articles/kenya")
 POOL = [MAZARI_BBC, MAZARI_AJ, VENEZUELA, KENYA]
 TOPIC = "human rights lawyers courts democracy"
 
@@ -500,7 +501,7 @@ class TrendVarietyTests(unittest.TestCase):
     def test_a_legend_does_not_repeat_an_event_or_a_title_within_the_window(self) -> None:
         stories = [
             # The same event in another feed's wording, ten days ago.
-            _story("legend-c", "2026-10-20", {"title": "Pakistan Sentences Rights Lawyer Imaan Mazari to Prison", "url": "https://www.nytimes.com/mazari"}),
+            _story("legend-c", "2026-10-20", {"title": "Pakistan Sentences Rights Lawyer Imaan Mazari to Prison", "url": "https://daily.example-times.org/mazari"}),
             # A title essentially the same as today's Kenya headline.
             _story("legend-c", "2026-10-25", title="Kenya's teachers end their strike after a pay deal"),
             # Older than the window, and a draft that failed: neither counts.
@@ -887,7 +888,7 @@ class ArticleTextTests(unittest.TestCase):
             self.assertTrue(issue["article_fetch"]["detail"], status)
 
     def test_redirects_are_followed_a_few_times_and_only_to_the_web(self) -> None:
-        moved = "https://www.bbc.com/news/articles/kenya"
+        moved = "https://www.example-news.com/articles/kenya"
         worker, issue = self._fetch({
             self.URL: FakeResponse(301, headers={"Location": moved}),
             moved: FakeResponse(body=_article_page()),
@@ -934,6 +935,58 @@ class ArticleTextTests(unittest.TestCase):
         self.assertLessEqual(len(text), worker_module.ARTICLE_TEXT_MAX_CHARS)
         self.assertGreater(len(text), worker_module.ARTICLE_TEXT_MAX_CHARS - 200)
         self.assertTrue(text.endswith(".)"), "cut at a paragraph's end")
+
+
+class ExcludedPublisherTests(unittest.TestCase):
+    """2026-11-01: the three default feeds (BBC World, NYT World, Al Jazeera)
+    belong to publishers whose terms allow personal, non-commercial use only
+    and need written permission for automated or AI use. Pending legal
+    review, their items never enter the pool, whatever brings them, and
+    their pages are never fetched."""
+
+    NYT = {**VENEZUELA, "url": "https://www.nytimes.com/2026/11/01/world/venezuela.html", "source": "rss.nytimes.com"}
+    BBC = {**KENYA, "url": "https://www.bbc.com/news/articles/kenya", "source": "feeds.bbci.co.uk"}
+    AJ = {**MAZARI_AJ, "url": "https://www.aljazeera.com/news/2026/11/1/mazari", "source": "www.aljazeera.com"}
+
+    def test_their_feeds_are_not_defaults_and_their_hosts_are_recognised(self) -> None:
+        import daily_story_worker as worker_module
+
+        self.assertFalse(any(worker_module.excluded_publisher(u) for u in worker_module.TREND_RSS_DEFAULTS))
+        for location in ("https://www.nytimes.com/x", "rss.nytimes.com", "https://feeds.bbci.co.uk/news/world/rss.xml",
+                         "www.bbc.co.uk", "https://bbc.com/news", "https://www.aljazeera.com/video/x", "aljazeera.net"):
+            self.assertTrue(worker_module.excluded_publisher(location), location)
+        for location in ("https://world.example-news.org/a", "notbbc.com", "https://www.nytimes.com.example.org/x", ""):
+            self.assertFalse(worker_module.excluded_publisher(location), location)
+
+    def test_a_feed_s_items_from_them_never_enter_the_pool_or_the_cache(self) -> None:
+        worker = _story_worker()
+        worker._fetch_trends_rss = mock.Mock(return_value=[self.NYT, self.BBC, self.AJ, MAZARI_BBC])
+        pool = worker._fetch_trending_issues(prefer_cache=False)
+        self.assertEqual([i["url"] for i in pool], [MAZARI_BBC["url"]])
+        self.assertEqual([d["url"] for d in worker.trend_cache_collection.docs], [MAZARI_BBC["url"]])
+
+    def test_items_cached_before_the_change_are_left_out(self) -> None:
+        worker = _story_worker()
+        now = __import__("time").time()
+        for issue in (self.AJ, self.NYT, KENYA):
+            worker.trend_cache_collection.insert_one({**issue, "fetched_at_ts": now})
+        self.assertEqual([i["url"] for i in worker._fetch_trending_issues()], [KENYA["url"]])
+
+    def test_their_pages_are_never_fetched_not_even_by_a_redirect(self) -> None:
+        worker = _story_worker()
+        worker.article_http = FakeHttp({self.NYT["url"]: FakeResponse(body=_article_page())})
+        issue = worker._with_article_text(self.NYT)
+        self.assertEqual(worker.article_http.requests, [], "no request is made")
+        self.assertEqual((issue["article_text"], issue["article_fetch"]["status"]), ("", "not_permitted"))
+        self.assertEqual(issue["article_fetch"]["fallback"], "title_and_summary")
+
+        worker.article_http = FakeHttp({
+            KENYA["url"]: FakeResponse(301, headers={"Location": self.BBC["url"]}),
+            self.BBC["url"]: FakeResponse(body=_article_page()),
+        })
+        issue = worker._with_article_text(KENYA)
+        self.assertEqual([url for url, _ in worker.article_http.requests], [KENYA["url"]])
+        self.assertEqual((issue["article_text"], issue["article_fetch"]["status"]), ("", "not_permitted"))
 
 
 class PersonaCheckTests(unittest.TestCase):
