@@ -332,6 +332,22 @@ DOMAIN_EXTRACT_PATTERN = re.compile(
     flags=re.I,
 )
 
+# First person plural, matched on the text as written. Case is what tells the
+# pronoun "us" from the country: "US", "U.S." and "USA" are the United States.
+# Run on lowercased text, the check failed every draft that named the US
+# (2026-11-01: all six drafts of the night failed persona_violation).
+FIRST_PERSON_PLURAL_PATTERN = re.compile(r"\b(?:[Ww]e|[Oo]urs?|us)\b")
+
+
+def first_person_plural(text: Any) -> Optional[str]:
+    """The first first-person-plural word in the prose of text, or None.
+    Links and [chunk:...] tags are not prose: a URL path such as /us/ or
+    /about-us is not the writer speaking."""
+    prose = URL_EXTRACT_PATTERN.sub(" ", safe_text(text))
+    prose = re.sub(r"\[chunk:[^\]]*\]", " ", prose, flags=re.I)
+    match = FIRST_PERSON_PLURAL_PATTERN.search(prose)
+    return match.group(0) if match else None
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -3343,9 +3359,10 @@ Malformed output:
             if token not in {"sir", "dr", "prof", "professor"}
         ]
         surname = name_tokens[-1] if name_tokens else ""
+        # "I ..." in any case; the plural only as written, so "US" stays the country.
         first_person_pattern = re.compile(
-            r"(?:\bI\s+(?:argue|believe|write|wrote|contend|maintain|have|am|was|will|see|remember|want|think|enjoyed|realized|decided)\b|\b(?:we|our|ours|us)\b)",
-            flags=re.I,
+            r"(?i:\bI\s+(?:argue|believe|write|wrote|contend|maintain|have|am|was|will|see|remember|want|think|enjoyed|realized|decided)\b)|"
+            + FIRST_PERSON_PLURAL_PATTERN.pattern
         )
 
         def scholar_relevance(item: Dict[str, Any]) -> Tuple[int, int, int, float]:
@@ -5098,14 +5115,17 @@ Return only JSON.
                 [
                     r"\bi\s+(?:argue|believe|write|wrote|contend|maintain|have|am|was|will|see|remember|want|think)\b",
                     r"\bmy\s+(?:work|research|life|view|argument|books|career|teaching)\b",
-                    r"\b(?:we|our|ours|us)\b",
                 ]
             )
 
-        for pat in impersonation_patterns:
-            if re.search(pat, lower_article):
-                errors.append(f"persona_violation:{pat}")
-                break
+        persona_violation = next((pat for pat in impersonation_patterns if re.search(pat, lower_article)), None)
+        if not persona_violation and assume_deceased:
+            # Read as written, not lowercased: "us" is the writer, "US" the country.
+            plural = first_person_plural(article)
+            if plural:
+                persona_violation = f"first_person_plural:{plural}"
+        if persona_violation:
+            errors.append(f"persona_violation:{persona_violation}")
 
         if assume_deceased:
             if any(self._matches_scholar_identity(byline, name) for byline in rendered_bylines):

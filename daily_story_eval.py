@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-from daily_story_worker import DailyStoryWorker, parse_date, safe_text, utc_now_iso
+from daily_story_worker import FIRST_PERSON_PLURAL_PATTERN, DailyStoryWorker, parse_date, safe_text, utc_now_iso
 from daily_story_personalize import GRADE_BANDS
 
 
@@ -22,7 +22,9 @@ def _word_count(text: str) -> int:
 
 def _first_person_hits(text: str) -> int:
     reader_text = re.sub(r"https?://\S+", " ", safe_text(text), flags=re.I)
-    return len(re.findall(r"\b(i|me|my|mine|we|our|ours|us)\b", reader_text.lower()))
+    singular = len(re.findall(r"\b(i|me|my|mine)\b", reader_text.lower()))
+    # The plural as written, as the worker checks it: "US" is the country.
+    return singular + len(FIRST_PERSON_PLURAL_PATTERN.findall(reader_text))
 
 
 def run_eval(*, story_date: str, window_days: int) -> Dict[str, Any]:

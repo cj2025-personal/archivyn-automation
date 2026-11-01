@@ -487,5 +487,57 @@ class TrendVarietyTests(unittest.TestCase):
         self.assertFalse([s for s in worker.stories_collection.docs if s["story_date"] == TODAY and s["scholar"]["profile_id"] == "legend-c"])
 
 
+class PersonaCheckTests(unittest.TestCase):
+    """2026-11-01: all six drafts failed persona_violation on \\b(?:we|our|ours|us)\\b,
+    run on lowercased text, so naming the US read as the writer saying "us"."""
+
+    def _persona_errors(self, article, assume_deceased=True):
+        worker = _story_worker()
+        payload = {"title": "A legend on sanctions", "standfirst": "x" * 30, "article_markdown": article}
+        _, errors, *_ = worker._validate_story(
+            name="Derrick Bell",
+            payload=payload,
+            context_chunks=[],
+            trend_issue=None,
+            allowed_source_urls=[],
+            allowed_chunk_ids=set(),
+            assume_deceased=assume_deceased,
+        )
+        return [e for e in errors if e.startswith("persona_violation")]
+
+    def test_the_united_states_is_not_the_writer(self) -> None:
+        article = (
+            "## Why This Matters Now\nThe US imposed new U.S. sanctions; USA Today reported the vote, "
+            "and Bell read US courts closely [chunk:us-law-1].\n\n## Sources\n"
+            "- https://www.nytimes.com/2026/10/31/us/politics/sanctions.html\n- https://example.org/about-us\n"
+        )
+        self.assertEqual(self._persona_errors(article), [])
+
+    def test_first_person_plural_still_fails_for_a_deceased_legend(self) -> None:
+        for phrase, word in [("we believe the ruling was wrong", "we"), ("our country owes more", "our"),
+                             ("Readers should join us in asking", "us"), ("We should ask", "We"), ("Ours is a law", "Ours")]:
+            self.assertEqual(
+                self._persona_errors(f"## Why This Matters Now\nBell on the US: {phrase}."),
+                [f"persona_violation:first_person_plural:{word}"],
+                phrase,
+            )
+        self.assertEqual(self._persona_errors("## Why\nwe believe it.", assume_deceased=False), [])
+
+    def test_a_scholar_sentence_naming_the_us_can_anchor_a_fallback(self) -> None:
+        worker = _story_worker()
+        sentence = "Derrick Bell argued that US courts advanced racial reform only when it served other interests."
+        chunks = [{"chunk_id": f"c{i}", "section": "about", "text": sentence} for i in range(4)]
+        payload = worker._build_strict_validation_fallback_payload(
+            name="Derrick Bell", topic="law", trend_issue=None, context_chunks=chunks, allowed_source_urls=[], note="t"
+        )
+        self.assertIn(sentence, payload["article_markdown"])
+
+    def test_the_eval_counts_the_pronoun_not_the_country(self) -> None:
+        import daily_story_eval as story_eval
+
+        self.assertEqual(story_eval._first_person_hits("The US and U.S. sanctions; USA. https://x.org/us/a"), 0)
+        self.assertEqual(story_eval._first_person_hits("We think our case is ours; join us."), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
