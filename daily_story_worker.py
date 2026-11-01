@@ -186,6 +186,7 @@ EVENT_NOISE_TOKENS = {"says", "amid", "live", "latest", "update", "updates", "re
 
 STORY_EVENT_PROJECTION = {
     "_id": 0,
+    "scholar.profile_id": 1,
     "trend_issue.selected.title": 1,
     "trend_issue.selected.url": 1,
     "content.title": 1,
@@ -491,6 +492,9 @@ class DailyStoryWorker:
             0,
             int(safe_text(os.getenv("STORY_TOPIC_REPEAT_WINDOW_DAYS")) or DEFAULT_TOPIC_REPEAT_WINDOW_DAYS),
         )
+        # The event each legend was given by this worker, by story date and
+        # profile id, whatever became of its draft (see _fresh_trend_issues).
+        self._event_picks: Dict[str, Dict[str, Dict[str, str]]] = {}
         self.style_sentence_samples = int(safe_text(os.getenv("STORY_STYLE_SENTENCE_SAMPLES")) or 120)
         env_enforce_quality = (
             safe_text(os.getenv("STORY_ENFORCE_PROFILE_QUALITY")).lower() in {"1", "true", "yes", "on"}
@@ -2223,23 +2227,32 @@ class DailyStoryWorker:
         """The trend issues this legend may still be written on for story_date,
         best-first order kept, and how many were ruled out for each reason.
 
-        Read from the stories already written, so the nightly run, the retry
-        stage and any rerun share one count: an event that other legends
-        already carry max_legends_per_event times that day is out, as is one
-        this legend wrote on (or under an essentially equal title) within the
-        repeat window. Failed stories count for neither."""
+        An event that other legends already carry max_legends_per_event times
+        that day is out, as is one this legend wrote on (or under an
+        essentially equal title) within the repeat window.
+
+        A legend carries an event if a stored story of that day is on it (so
+        the nightly run, the retry stage and any rerun share one count;
+        failed stories count for neither rule) or if this worker gave it that
+        event for the day, whatever became of the draft. Counting only stored
+        stories let every legend take the same event on a night when every
+        draft failed (2026-11-01: four of six on one headline)."""
         blocked = {"at_event_cap": 0, "repeats_legend": 0}
         if not issues:
             return [], blocked
 
         live = {"$nin": list(FAILED_STORY_STATUSES)}
-        today = [
-            self._story_events(story)
-            for story in self.stories_collection.find(
-                {"story_date": story_date, "status": live, "scholar.profile_id": {"$ne": profile_id}},
-                STORY_EVENT_PROJECTION,
-            )
-        ]
+        events_by_legend: Dict[str, List[Dict[str, str]]] = {}
+        for story in self.stories_collection.find(
+            {"story_date": story_date, "status": live, "scholar.profile_id": {"$ne": profile_id}},
+            STORY_EVENT_PROJECTION,
+        ):
+            legend = safe_text((story.get("scholar") or {}).get("profile_id")) or f"story-{len(events_by_legend)}"
+            events_by_legend.setdefault(legend, []).extend(self._story_events(story))
+        for legend, event in self._event_picks.get(story_date, {}).items():
+            if legend != profile_id:
+                events_by_legend.setdefault(legend, []).append(event)
+        today = list(events_by_legend.values())
         covered_by_legend: List[Dict[str, str]] = []
         if self.topic_repeat_window_days > 0:
             window_start = (date.fromisoformat(story_date) - timedelta(days=self.topic_repeat_window_days)).isoformat()
@@ -2266,6 +2279,16 @@ class DailyStoryWorker:
                 continue
             fresh.append(issue)
         return fresh, blocked
+
+    def _record_event_pick(self, *, story_date: str, profile_id: str, issue: Optional[Dict[str, Any]]) -> None:
+        """Hold the event a legend was given, for the per-event cap of the
+        legends after it, before its draft is written or fails."""
+        if not issue or not (safe_text(issue.get("title")) or safe_text(issue.get("url"))):
+            return
+        self._event_picks.setdefault(story_date, {})[profile_id] = {
+            "title": safe_text(issue.get("title")),
+            "url": safe_text(issue.get("url")),
+        }
 
     def _mine_statistical_phrases(
         self,
@@ -5349,6 +5372,9 @@ Return only JSON.
             disclosure = self._build_disclosure(professor_name, self.assume_deceased)
             style_profile = self._build_style_profile(scholar_doc)
             trend_issue = self._select_trending_issue(topic, trend_candidates)
+            # The event holds this legend's place from here on, even if the
+            # draft fails, so the legends after it are spread across events.
+            self._record_event_pick(story_date=story_date, profile_id=profile_id, issue=trend_issue)
             if self.strict_reliability and self.trends_enabled and not trend_issue:
                 if not self.allow_corpus_only_when_no_trend:
                     summary["failed_no_trend_data"] += 1

@@ -487,6 +487,66 @@ class TrendVarietyTests(unittest.TestCase):
         self.assertFalse([s for s in worker.stories_collection.docs if s["story_date"] == TODAY and s["scholar"]["profile_id"] == "legend-c"])
 
 
+def _run_day(worker, *, dry_run=True, **patches):
+    """worker.run over the fake pool with the corpus steps stubbed; extra
+    patches are worker attributes to replace (name=mock)."""
+    chunks = [{"chunk_id": f"c{i}", "section": "about", "text": "x"} for i in range(4)]
+    stubs = {
+        "_fetch_trending_issues": mock.Mock(return_value=list(POOL)),
+        "_choose_topic": mock.Mock(return_value=(TOPIC, "test", 0)),
+        "_extract_context_chunks": mock.Mock(return_value=chunks),
+        "_build_style_profile": mock.Mock(return_value={}),
+        "_collect_allowed_source_urls": mock.Mock(return_value=[]),
+        **patches,
+    }
+    with mock.patch.multiple(worker, **stubs):
+        return worker.run(
+            scholar_id=None,
+            date_value=date.fromisoformat(TODAY),
+            topic_override=None,
+            max_scholars=20,
+            max_context_chunks=12,
+            dry_run=dry_run,
+        )
+
+
+class RunEventCapTests(unittest.TestCase):
+    """2026-11-01: every draft failed, so no story held a place on its event,
+    and four of six legends were written on one headline. A legend's event
+    holds its place for the rest of the run whatever becomes of its draft."""
+
+    def test_a_night_when_every_draft_fails_still_spreads_its_legends(self) -> None:
+        scholars = [{"profile_id": f"legend-{n}", "professor_name": f"Legend {n}"} for n in range(7)]
+        worker = _story_worker(scholars=scholars)
+        generate = mock.Mock(wraps=worker._generate_story_payload)
+        result = _run_day(
+            worker,
+            _generate_story_payload=generate,
+            _validate_story=mock.Mock(side_effect=lambda **_: (False, ["insufficient_concrete_details"], [], [], [], "")),
+        )
+        written_on = [c.kwargs["trend_issue"]["title"] for c in generate.call_args_list]
+        self.assertEqual(
+            written_on,
+            [MAZARI_BBC["title"], MAZARI_BBC["title"], VENEZUELA["title"], VENEZUELA["title"], KENYA["title"], KENYA["title"]],
+        )
+        self.assertEqual(result["summary"]["failed_validation"], 6)
+        self.assertEqual(result["summary"]["skipped_no_fresh_trend"], 1)
+        self.assertEqual({s["status"] for s in worker.stories_collection.docs}, {"failed_validation"})
+
+    def test_a_legend_s_stored_story_and_its_pick_hold_one_place(self) -> None:
+        worker = _story_worker([_story("legend-a", TODAY, MAZARI_BBC)])
+        worker._record_event_pick(story_date=TODAY, profile_id="legend-a", issue=MAZARI_BBC)
+        fresh, blocked = worker._fresh_trend_issues(POOL, profile_id="legend-b", story_date=TODAY)
+        self.assertEqual(blocked["at_event_cap"], 0, "legend-a is one legend on the event, not two")
+        worker._record_event_pick(story_date=TODAY, profile_id="legend-b", issue=MAZARI_AJ)
+        fresh, blocked = worker._fresh_trend_issues(POOL, profile_id="legend-c", story_date=TODAY)
+        self.assertEqual([i["title"] for i in fresh], [VENEZUELA["title"], KENYA["title"]])
+        self.assertEqual(blocked["at_event_cap"], 2)
+        # A legend's own pick holds no place against it, and a pick is for its day only.
+        self.assertEqual(len(worker._fresh_trend_issues(POOL, profile_id="legend-b", story_date=TODAY)[0]), 4)
+        self.assertEqual(len(worker._fresh_trend_issues(POOL, profile_id="legend-c", story_date="2026-10-31")[0]), 4)
+
+
 class PersonaCheckTests(unittest.TestCase):
     """2026-11-01: all six drafts failed persona_violation on \\b(?:we|our|ours|us)\\b,
     run on lowercased text, so naming the US read as the writer saying "us"."""
