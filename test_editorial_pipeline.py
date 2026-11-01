@@ -11,6 +11,7 @@ scripts resolve to.
 Run with:  python -m unittest test_editorial_pipeline
 """
 import os
+import re
 import unittest
 from datetime import date
 from unittest import mock
@@ -310,8 +311,13 @@ class FakeMongoCollection:
     def insert_one(self, doc):
         self.docs.append(doc)
 
-    def update_one(self, *_args, **_kwargs):
-        pass
+    def update_one(self, query, update, upsert=False):
+        for doc in self.docs:
+            if _matches(doc, query):
+                doc.update(update.get("$set", {}))
+                return
+        if upsert:
+            self.docs.append({**query, **update.get("$set", {})})
 
 
 class FakeDatabase(dict):
@@ -369,18 +375,20 @@ def _story(profile_id, story_date, issue=None, title="", status="pending_review"
     }
 
 
-def _story_worker(stories=(), scholars=(), **env):
+def _story_worker(stories=(), scholars=(), db=None, **env):
     import daily_story_worker as worker_module
 
-    db = FakeDatabase()
-    db["legend_scholar_daily_stories"] = FakeMongoCollection(stories)
-    db["legend_scholars"] = FakeMongoCollection(scholars)
+    if db is None:
+        db = FakeDatabase()
+        db["legend_scholar_daily_stories"] = FakeMongoCollection(stories)
+        db["legend_scholars"] = FakeMongoCollection(scholars)
     settings = {
         "MONGODB_URI": "mongodb://fake/test",
         "STORY_ML_ENABLED": "0",
         "STORY_ENFORCE_PROFILE_QUALITY": "",
         "STORY_MAX_LEGENDS_PER_EVENT": "",
         "STORY_TOPIC_REPEAT_WINDOW_DAYS": "",
+        "STORY_RELEVANCE_SHORTLIST": "",
         **env,
     }
     with mock.patch.dict(os.environ, settings), \
@@ -462,7 +470,7 @@ class TrendVarietyTests(unittest.TestCase):
                 mock.patch.object(worker, "_extract_context_chunks", return_value=chunks), \
                 mock.patch.object(worker, "_build_style_profile", return_value={}), \
                 mock.patch.object(worker, "_collect_allowed_source_urls", return_value=[]), \
-                mock.patch.object(worker, "_select_trending_issue", wraps=worker._select_trending_issue) as select, \
+                mock.patch.object(worker, "_rank_trending_issues", wraps=worker._rank_trending_issues) as select, \
                 mock.patch.object(worker, "_generate_story_payload", side_effect=RuntimeError("no model in tests")):
             result = worker.run(
                 scholar_id=None,
@@ -545,6 +553,122 @@ class RunEventCapTests(unittest.TestCase):
         # A legend's own pick holds no place against it, and a pick is for its day only.
         self.assertEqual(len(worker._fresh_trend_issues(POOL, profile_id="legend-b", story_date=TODAY)[0]), 4)
         self.assertEqual(len(worker._fresh_trend_issues(POOL, profile_id="legend-c", story_date="2026-10-31")[0]), 4)
+
+
+def _fake_judge(ratings_by_title, *, failing_legends=()):
+    """A relevance judge: rates each event in its prompt by headline
+    (unlisted: "none"), and fails for a legend named in failing_legends."""
+
+    def judge(prompt, _schema, _max_tokens):
+        if any(name in prompt for name in failing_legends):
+            raise RuntimeError("503 model overloaded")
+        return {
+            "ratings": [
+                {"event_id": event_id, "rating": ratings_by_title.get(title, "none"), "reason": f"on {title[:24]}"}
+                for event_id, title in re.findall(r"^\[(E\d+)\] (.+)$", prompt, flags=re.M)
+            ]
+        }
+
+    return mock.Mock(side_effect=judge)
+
+
+class TrendRelevanceJudgeTests(unittest.TestCase):
+    """2026-11-01: the score gave a legal scholar, a civil rights lawyer, an
+    artist and an economist the same headline, "Thailand's Most Famous Snake
+    Catcher". Whether a legend's work can honestly examine an event is now the
+    model's call, over the score's top few."""
+
+    CHUNKS = [{"chunk_id": "c1", "section": "about", "text": "Bell taught constitutional law and civil rights."}]
+
+    def _choose(self, worker, profile_id="legend-a", story_date=TODAY):
+        return worker._choose_relevant_trend_issue(
+            profile_id=profile_id,
+            name="Derrick Bell",
+            topic=TOPIC,
+            story_date=story_date,
+            ranked=worker._rank_trending_issues(TOPIC, POOL),
+            context_chunks=self.CHUNKS,
+            judge=True,
+        )
+
+    def test_a_strong_match_is_taken_over_a_better_scored_one(self) -> None:
+        worker = _story_worker()
+        self.assertEqual(worker._select_trending_issue(TOPIC, POOL)["title"], MAZARI_BBC["title"], "the score's pick")
+        judge = _fake_judge({MAZARI_BBC["title"]: "weak", MAZARI_AJ["title"]: "weak", KENYA["title"]: "strong"})
+        with mock.patch.object(worker, "_call_structured_json", judge):
+            picked, relevance = self._choose(worker)
+        self.assertEqual(picked["title"], KENYA["title"])
+        self.assertEqual((relevance["rating"], relevance["reason"]), ("strong", f"on {KENYA['title'][:24]}"))
+        self.assertEqual(
+            {row["title"]: row["rating"] for row in relevance["judged"]},
+            {MAZARI_BBC["title"]: "weak", MAZARI_AJ["title"]: "weak", VENEZUELA["title"]: "none", KENYA["title"]: "strong"},
+        )
+        prompt = judge.call_args.args[0]
+        self.assertIn("Bell taught constitutional law", prompt, "the judge sees the legend's documented work")
+        # Of two strong events, the better scored is taken.
+        with mock.patch.object(worker, "_call_structured_json", _fake_judge({VENEZUELA["title"]: "strong", KENYA["title"]: "strong"})):
+            self.assertEqual(self._choose(worker, profile_id="legend-b")[0]["title"], VENEZUELA["title"])
+
+    def test_only_the_score_s_top_few_are_judged(self) -> None:
+        worker = _story_worker(STORY_RELEVANCE_SHORTLIST="2")
+        judge = _fake_judge({KENYA["title"]: "strong"})
+        with mock.patch.object(worker, "_call_structured_json", judge):
+            picked, relevance = self._choose(worker)
+        self.assertIsNone(picked, "Kenya is strong but not in the top two")
+        self.assertEqual(len(re.findall(r"^\[E\d+\] ", judge.call_args.args[0], flags=re.M)), 2)
+        self.assertEqual(relevance["reason"], "none of the top 2 events is a strong match for this legend (2 none)")
+
+    def test_a_verdict_is_asked_once_per_legend_event_and_day(self) -> None:
+        db = FakeDatabase()
+        worker = _story_worker(db=db)
+        judge = _fake_judge({KENYA["title"]: "strong"})
+        with mock.patch.object(worker, "_call_structured_json", judge):
+            self._choose(worker)
+            self._choose(worker)
+        self.assertEqual(judge.call_count, 1)
+        # The retry stage's worker, later the same day, reads the kept verdicts.
+        retry = _story_worker(db=db)
+        with mock.patch.object(retry, "_call_structured_json", judge):
+            self.assertEqual(self._choose(retry)[0]["title"], KENYA["title"])
+            self.assertEqual(judge.call_count, 1)
+            self._choose(retry, profile_id="legend-b")
+            self._choose(retry, story_date="2026-10-31")
+        self.assertEqual(judge.call_count, 3, "another legend, or another day, is asked")
+        kept = db["daily_story_trend_relevance"].docs
+        self.assertEqual(len(kept), 12)
+        self.assertEqual({k["policy_version"] for k in kept}, {"2026-11-01"})
+
+    def test_a_run_skips_a_legend_with_no_strong_event_and_survives_the_judge_failing(self) -> None:
+        scholars = [
+            {"profile_id": "legend-0", "professor_name": "Derrick Bell"},
+            {"profile_id": "legend-1", "professor_name": "Lani Guinier"},
+            {"profile_id": "legend-2", "professor_name": "Samella Lewis"},
+        ]
+        worker = _story_worker(scholars=scholars)
+        worker.use_llm = True  # the judge runs only in a run that calls the model
+        placeholder = worker._generate_story_payload
+        judge = mock.Mock(side_effect=lambda prompt, *_: _fake_judge(
+            {KENYA["title"]: "strong"} if "Derrick Bell" in prompt else {}, failing_legends=("Lani Guinier",)
+        )(prompt, None, None))
+        result = _run_day(
+            worker,
+            dry_run=False,
+            _call_structured_json=judge,
+            _generate_story_payload=mock.Mock(side_effect=lambda **kw: placeholder(**{**kw, "dry_run": True})),
+            _validate_story=mock.Mock(side_effect=lambda **kw: (True, [], [], ["c0"], [], KENYA["url"])),
+        )
+        self.assertEqual(result["summary"]["generated"], 1)
+        self.assertEqual(result["summary"]["skipped_no_relevant_trend"], 2)
+        self.assertEqual(
+            [e for e in result["errors"] if "skipped_no_relevant_trend" in e],
+            [
+                "legend-1:skipped_no_relevant_trend:judge_error:503 model overloaded",
+                "legend-2:skipped_no_relevant_trend:none of the top 4 events is a strong match for this legend (4 none)",
+            ],
+        )
+        [story] = worker.stories_collection.docs
+        self.assertEqual(story["trend_issue"]["selected"]["title"], KENYA["title"])
+        self.assertEqual(story["trend_issue"]["relevance"]["rating"], "strong")
 
 
 class PersonaCheckTests(unittest.TestCase):

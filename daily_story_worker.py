@@ -192,6 +192,35 @@ STORY_EVENT_PROJECTION = {
     "content.title": 1,
 }
 
+# Whether a legend's documented work can honestly examine a news event is the
+# model's call; the score only orders the shortlist it is asked about. On
+# 2026-11-01 the score gave a legal scholar, a civil rights lawyer, an artist
+# and an economist the same headline: "Thailand's Most Famous Snake Catcher".
+# A legend with no "strong" event among the top STORY_RELEVANCE_SHORTLIST sits
+# the day out. Verdicts are kept per legend, event and day (and serve as
+# labelled decisions); a new policy version asks again.
+TREND_RELEVANCE_POLICY_VERSION = "2026-11-01"
+DEFAULT_RELEVANCE_SHORTLIST = 4
+TREND_RELEVANCE_RATINGS = ("strong", "weak", "none")
+TREND_RELEVANCE_SCHEMA: Dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "ratings": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "event_id": {"type": "STRING"},
+                    "rating": {"type": "STRING", "enum": list(TREND_RELEVANCE_RATINGS)},
+                    "reason": {"type": "STRING"},
+                },
+                "required": ["event_id", "rating", "reason"],
+            },
+        },
+    },
+    "required": ["ratings"],
+}
+
 STYLE_CONNECTORS = [
     "however",
     "therefore",
@@ -495,6 +524,12 @@ class DailyStoryWorker:
         # The event each legend was given by this worker, by story date and
         # profile id, whatever became of its draft (see _fresh_trend_issues).
         self._event_picks: Dict[str, Dict[str, Dict[str, str]]] = {}
+        self.relevance_shortlist = max(
+            1,
+            int(safe_text(os.getenv("STORY_RELEVANCE_SHORTLIST")) or DEFAULT_RELEVANCE_SHORTLIST),
+        )
+        self.relevance_collection = self.db["daily_story_trend_relevance"]
+        self._relevance_cache: Dict[str, Dict[str, Any]] = {}
         self.style_sentence_samples = int(safe_text(os.getenv("STORY_STYLE_SENTENCE_SAMPLES")) or 120)
         env_enforce_quality = (
             safe_text(os.getenv("STORY_ENFORCE_PROFILE_QUALITY")).lower() in {"1", "true", "yes", "on"}
@@ -620,6 +655,8 @@ class DailyStoryWorker:
         self.trend_cache_collection.create_index("issue_key", unique=True)
         self.trend_cache_collection.create_index([("fetched_at", -1)])
         self.trend_cache_collection.create_index([("published_at_dt", -1)])
+        self.relevance_collection.create_index("cache_key", unique=True)
+        self.relevance_collection.create_index([("profile_id", 1), ("story_date", 1)])
 
     def close(self) -> None:
         try:
@@ -2107,8 +2144,16 @@ class DailyStoryWorker:
         return selected
 
     def _select_trending_issue(self, topic: str, issues: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The best-scored issue for topic, or None."""
+        ranked = self._rank_trending_issues(topic, issues)
+        return ranked[0] if ranked else None
+
+    def _rank_trending_issues(self, topic: str, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """The issues a story may be anchored to, best score for topic first
+        (ties keep the feed's order), each a copy with its selection_score.
+        The score only orders the shortlist; the relevance judge decides."""
         if not issues:
-            return None
+            return []
 
         candidates = issues
         if self.require_verified_trend_url:
@@ -2117,7 +2162,7 @@ class DailyStoryWorker:
                 if self._is_valid_external_url(safe_text(i.get("url")))
             ]
         if not candidates:
-            return None
+            return []
 
         topic_tokens = set(self._topic_tokens(topic))
         issue_texts = [safe_text(i.get("text")) for i in candidates]
@@ -2156,8 +2201,7 @@ class DailyStoryWorker:
             age_hours = max(0.0, (now - dt).total_seconds() / 3600.0)
             recency_scores.append(float(1.0 / (1.0 + age_hours / 48.0)))
 
-        best_idx = 0
-        best_score = -1.0
+        scores: List[float] = []
         for idx in range(len(candidates)):
             if cross is not None:
                 score = (
@@ -2168,13 +2212,207 @@ class DailyStoryWorker:
                 )
             else:
                 score = 0.55 * dense_scores[idx] + 0.35 * lexical_scores[idx] + 0.10 * recency_scores[idx]
-            if score > best_score:
-                best_score = score
-                best_idx = idx
+            scores.append(float(score))
 
-        selected = dict(candidates[best_idx])
-        selected["selection_score"] = round(float(best_score), 4)
-        return selected
+        ranked: List[Dict[str, Any]] = []
+        for idx in sorted(range(len(candidates)), key=lambda i: -scores[i]):
+            item = dict(candidates[idx])
+            item["selection_score"] = round(scores[idx], 4)
+            ranked.append(item)
+        return ranked
+
+    def _relevance_cache_key(self, *, profile_id: str, story_date: str, issue: Dict[str, Any]) -> str:
+        base = f"{TREND_RELEVANCE_POLICY_VERSION}|{profile_id}|{story_date}|{self._trend_issue_key(issue)}"
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()[:32]
+
+    def _cached_relevance(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        if cache_key in self._relevance_cache:
+            return self._relevance_cache[cache_key]
+        try:
+            stored = self.relevance_collection.find_one({"cache_key": cache_key}, {"_id": 0})
+        except Exception:
+            stored = None
+        if isinstance(stored, dict) and stored.get("rating") in TREND_RELEVANCE_RATINGS:
+            self._relevance_cache[cache_key] = stored
+            return stored
+        return None
+
+    def _store_relevance(self, verdict: Dict[str, Any]) -> None:
+        self._relevance_cache[verdict["cache_key"]] = verdict
+        try:
+            self.relevance_collection.update_one({"cache_key": verdict["cache_key"]}, {"$set": dict(verdict)}, upsert=True)
+        except Exception:
+            pass  # the verdict still holds for this worker; a later run asks again
+
+    @staticmethod
+    def _trend_relevance_prompt(
+        *,
+        name: str,
+        topic: str,
+        context_chunks: List[Dict[str, Any]],
+        events: List[Tuple[str, Dict[str, Any]]],
+    ) -> str:
+        excerpts = []
+        for chunk in context_chunks[:8]:
+            text = re.sub(r"\s+", " ", safe_text(chunk.get("text")))[:450]
+            if text:
+                excerpts.append(f"- ({safe_text(chunk.get('section')) or 'profile'}) {text}")
+        event_blocks = []
+        for event_id, issue in events:
+            summary = re.sub(r"\s+", " ", safe_text(issue.get("summary")))[:400] or "(no summary)"
+            event_blocks.append(
+                f"[{event_id}] {safe_text(issue.get('title'))}\n"
+                f"Summary: {summary}\n"
+                f"Source: {safe_text(issue.get('source')) or 'unknown'}, {safe_text(issue.get('published_at')) or 'undated'}"
+            )
+        excerpt_blob = "\n".join(excerpts) or "- (none)"
+        event_blob = "\n\n".join(event_blocks)
+        return f"""You decide which of today's news events an article can honestly examine through the
+documented work of {name}.
+
+The article looks at one current news event through {name}'s ideas. It cannot ask {name} for
+comment, so it may bring to the event only what their documented work, below, supports.
+Rate every event:
+- strong: the event turns on questions {name}'s documented work directly addresses (its subject,
+  field or arguments), so the article can apply that work to the event without stretching it.
+- weak: the only link is a broad theme (justice, inequality, culture, the economy) or an analogy
+  the work itself does not draw.
+- none: no honest link.
+Judge the fit between the event and the work, not how important or recent the event is. Give a
+one-line reason naming what in the work does or does not bear on the event.
+
+Return JSON only: {{"ratings": [{{"event_id": "E1", "rating": "strong" | "weak" | "none", "reason": "..."}}]}}
+
+{name}'s topic today, from their corpus: {topic}
+{name}'s documented work (excerpts):
+{excerpt_blob}
+
+Today's events:
+
+{event_blob}
+"""
+
+    def _judge_trend_relevance(
+        self,
+        *,
+        profile_id: str,
+        name: str,
+        topic: str,
+        story_date: str,
+        shortlist: List[Dict[str, Any]],
+        context_chunks: List[Dict[str, Any]],
+    ) -> List[Optional[Dict[str, Any]]]:
+        """The model's verdict on each shortlisted event for this legend, in
+        shortlist order (None where it gave no usable rating). Kept verdicts
+        are reused; only the rest are asked about, in one call. Raises when
+        the model call fails."""
+        keys = [self._relevance_cache_key(profile_id=profile_id, story_date=story_date, issue=i) for i in shortlist]
+        verdicts: List[Optional[Dict[str, Any]]] = [self._cached_relevance(k) for k in keys]
+        to_ask = {f"E{n + 1}": idx for n, idx in enumerate(i for i, v in enumerate(verdicts) if v is None)}
+        if not to_ask:
+            return verdicts
+
+        prompt = self._trend_relevance_prompt(
+            name=name,
+            topic=topic,
+            context_chunks=context_chunks,
+            events=[(event_id, shortlist[idx]) for event_id, idx in to_ask.items()],
+        )
+        payload = self._call_structured_json(prompt, TREND_RELEVANCE_SCHEMA, 4096)
+        ratings = payload.get("ratings") if isinstance(payload, dict) else None
+        if not isinstance(ratings, list):
+            raise RuntimeError("relevance judge returned no ratings")
+        for row in ratings:
+            if not isinstance(row, dict):
+                continue
+            idx = to_ask.get(safe_text(row.get("event_id")).upper())
+            rating = safe_text(row.get("rating")).lower()
+            if idx is None or verdicts[idx] is not None or rating not in TREND_RELEVANCE_RATINGS:
+                continue
+            issue = shortlist[idx]
+            verdict = {
+                "cache_key": keys[idx],
+                "policy_version": TREND_RELEVANCE_POLICY_VERSION,
+                "profile_id": profile_id,
+                "story_date": story_date,
+                "event_key": self._trend_issue_key(issue),
+                "event_title": safe_text(issue.get("title")),
+                "event_url": safe_text(issue.get("url")),
+                "rating": rating,
+                "reason": safe_text(row.get("reason"))[:300],
+                "judge": safe_text(self.model_name) or "vertex",
+                "judged_at": utc_now_iso(),
+            }
+            self._store_relevance(verdict)
+            verdicts[idx] = verdict
+        return verdicts
+
+    def _choose_relevant_trend_issue(
+        self,
+        *,
+        profile_id: str,
+        name: str,
+        topic: str,
+        story_date: str,
+        ranked: List[Dict[str, Any]],
+        context_chunks: List[Dict[str, Any]],
+        judge: bool,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """The event this legend is written on, and the relevance record kept
+        on the story. The model rates the top relevance_shortlist events by
+        score; the best-scored "strong" one is taken. With none strong, or
+        when the judge fails, there is no event (the legend sits the day
+        out) and the record's reason says why. A run that makes no model
+        calls (a dry run) takes the best score, marked unjudged."""
+        if not ranked:
+            return None, {}
+        shortlist = ranked[: self.relevance_shortlist]
+        base = {"policy_version": TREND_RELEVANCE_POLICY_VERSION, "shortlist_size": len(shortlist)}
+        if not judge:
+            return dict(ranked[0]), {
+                **base,
+                "rating": "unjudged",
+                "reason": "no model call in this run (dry run)",
+                "judge": "none",
+            }
+        try:
+            verdicts = self._judge_trend_relevance(
+                profile_id=profile_id,
+                name=name,
+                topic=topic,
+                story_date=story_date,
+                shortlist=shortlist,
+                context_chunks=context_chunks,
+            )
+        except Exception as exc:
+            error = re.sub(r"\s+", " ", safe_text(exc))[:200]
+            return None, {
+                **base,
+                "rating": "unjudged",
+                "reason": f"judge_error:{error}",
+                "judge": safe_text(self.model_name) or "vertex",
+            }
+        judged = [
+            {
+                "title": safe_text(issue.get("title")),
+                "url": safe_text(issue.get("url")),
+                "selection_score": issue.get("selection_score"),
+                "rating": (verdict or {}).get("rating", "unrated"),
+                "reason": (verdict or {}).get("reason", ""),
+            }
+            for issue, verdict in zip(shortlist, verdicts)
+        ]
+        record = {**base, "judge": safe_text(self.model_name) or "vertex", "judged": judged}
+        for issue, verdict in zip(shortlist, verdicts):
+            if verdict and verdict.get("rating") == "strong":
+                return dict(issue), {**record, "rating": "strong", "reason": safe_text(verdict.get("reason"))}
+        counts = Counter(row["rating"] for row in judged)
+        detail = ", ".join(f"{counts[r]} {r}" for r in ("weak", "none", "unrated") if counts[r])
+        return None, {
+            **record,
+            "rating": "no_strong_match",
+            "reason": f"none of the top {len(shortlist)} events is a strong match for this legend ({detail})",
+        }
 
     @staticmethod
     def _event_tokens(text: Any) -> set:
@@ -3202,6 +3440,49 @@ Malformed output:
             f"{last_error}; finish_hint={last_finish_hint or 'n/a'}; "
             f"content_preview={content_preview or 'empty'}"
         )
+
+    def _call_structured_json(self, prompt: str, schema: Dict[str, Any], max_tokens: int) -> Dict[str, Any]:
+        """One JSON object from the model for a judge's prompt: schema-bound
+        first, then plain JSON, then free text (as the personalisation stage
+        calls it). Raises when the model gives nothing usable."""
+        if not self.vertex_model or GenerationConfig is None:
+            raise RuntimeError("Vertex model is not available")
+        last_error: Optional[Exception] = None
+        last_content = ""
+        # Thinking models spend from the same budget.
+        token_budget = max(8192, max_tokens)
+        for attempt, (temperature, enforce_schema, enforce_json) in enumerate((
+            (0.15, True, True),
+            (0.05, False, True),
+            (0.0, False, False),
+        )):
+            try:
+                if enforce_schema:
+                    config = GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=token_budget,
+                        response_mime_type="application/json",
+                        response_schema=schema,
+                    )
+                elif enforce_json:
+                    config = GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=token_budget,
+                        response_mime_type="application/json",
+                    )
+                else:
+                    config = GenerationConfig(temperature=temperature, max_output_tokens=token_budget)
+                response = self.vertex_model.generate_content(prompt, generation_config=config)
+                last_content = self._flatten_vertex_text(response)
+                parsed = self._extract_json_object(last_content)
+                if isinstance(parsed, dict):
+                    return parsed
+                last_error = RuntimeError("model returned invalid JSON")
+            except Exception as exc:  # pragma: no cover - external SDK behaviour
+                last_error = exc
+                time.sleep(1.25 * (2 ** attempt))
+        preview = re.sub(r"\s+", " ", safe_text(last_content))[:200]
+        raise RuntimeError(f"structured call failed: {last_error}; content_preview={preview or 'empty'}")
 
     def _build_llm_failure_fallback_payload(
         self,
@@ -5236,6 +5517,8 @@ Return only JSON.
                 "trend_region": self.trend_region,
                 "max_legends_per_event": self.max_legends_per_event,
                 "topic_repeat_window_days": self.topic_repeat_window_days,
+                "relevance_shortlist": self.relevance_shortlist,
+                "relevance_policy_version": TREND_RELEVANCE_POLICY_VERSION,
                 "enforce_profile_quality": self.enforce_profile_quality,
                 "profile_quality_min_score": self.profile_quality_min_score,
                 "strict_reliability": self.strict_reliability,
@@ -5267,6 +5550,7 @@ Return only JSON.
                 "skipped_existing": 0,
                 "skipped_profile_quality": 0,
                 "skipped_no_fresh_trend": 0,
+                "skipped_no_relevant_trend": 0,
                 "degraded_no_trend_data": 0,
                 "failed_no_trend_data": 0,
                 "failed_no_context": 0,
@@ -5371,7 +5655,22 @@ Return only JSON.
             allowed_chunk_ids = {c["chunk_id"] for c in context_chunks}
             disclosure = self._build_disclosure(professor_name, self.assume_deceased)
             style_profile = self._build_style_profile(scholar_doc)
-            trend_issue = self._select_trending_issue(topic, trend_candidates)
+            ranked_trends = self._rank_trending_issues(topic, trend_candidates)
+            trend_issue, trend_relevance = self._choose_relevant_trend_issue(
+                profile_id=profile_id,
+                name=professor_name,
+                topic=topic,
+                story_date=story_date,
+                ranked=ranked_trends,
+                context_chunks=context_chunks,
+                judge=self.use_llm and not dry_run,
+            )
+            if ranked_trends and not trend_issue:
+                # No event this legend's work can honestly speak to today:
+                # the legend sits the day out rather than take a weak match.
+                summary["skipped_no_relevant_trend"] += 1
+                all_errors.append(f"{profile_id}:skipped_no_relevant_trend:{trend_relevance.get('reason', '')}")
+                continue
             # The event holds this legend's place from here on, even if the
             # draft fails, so the legends after it are spread across events.
             self._record_event_pick(story_date=story_date, profile_id=profile_id, issue=trend_issue)
@@ -5666,6 +5965,7 @@ Return only JSON.
                     "provider": self.trend_provider,
                     "selected": trend_issue or {},
                     "verified_source_url": trend_source_url,
+                    "relevance": trend_relevance,
                 },
                 "style_profile": style_profile,
                 "content": {
