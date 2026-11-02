@@ -8,10 +8,12 @@ checked without a database or a model: which grade band a reader falls in,
 how text is measured, what makes a variant unservable, and which database the
 scripts resolve to.
 
-Run with:  python -m unittest test_editorial_pipeline
+Run with:  python -m unittest discover -p "test_*.py"
 """
+import json
 import os
 import re
+import types
 import unittest
 from datetime import date
 from unittest import mock
@@ -401,13 +403,36 @@ def _story(profile_id, story_date, issue=None, title="", status="pending_review"
     }
 
 
+def _identified(doc, **review):
+    """The legend with a current identity review that lets it be written
+    about, every stored page ruled about the legend (unless the legend
+    already carries a review). Keyword arguments override the review."""
+    import legend_identity as identity
+
+    if "identity_review" in doc:
+        return doc
+    pages, _ = identity.source_pages(doc)
+    return {**doc, "identity_review": {
+        "policy_version": identity.IDENTITY_POLICY_VERSION,
+        "status": identity.VERIFIED,
+        "eligible": True,
+        "name_check": "correct",
+        "name_reviewed": identity.stored_name(doc),
+        "anchor": identity.anchor_for(doc),
+        "sources_hash": identity.sources_hash(doc),
+        "pages": [{"key": p["key"], "verdict": identity.ABOUT_LEGEND} for p in pages],
+        "allowed_page_keys": [p["key"] for p in pages],
+        **review,
+    }}
+
+
 def _story_worker(stories=(), scholars=(), db=None, **env):
     import daily_story_worker as worker_module
 
     if db is None:
         db = FakeDatabase()
         db["legend_scholar_daily_stories"] = FakeMongoCollection(stories)
-        db["legend_scholars"] = FakeMongoCollection(scholars)
+        db["legend_scholars"] = FakeMongoCollection([_identified(s) for s in scholars])
     settings = {
         "MONGODB_URI": "mongodb://fake/test",
         "STORY_ML_ENABLED": "0",
@@ -631,8 +656,9 @@ class StoryCandidateTests(unittest.TestCase):
     are the legends that pass the gate, least recently written first."""
 
     def _candidates(self, worker, story_date=TODAY, max_scholars=25):
-        docs, excluded = worker._story_candidates(story_date, max_scholars)
-        return [d["profile_id"] for d in docs], excluded
+        """(the candidates' ids, how many the profile-quality gate kept out)."""
+        docs, kept_out = worker._story_candidates(story_date, max_scholars)
+        return [d["profile_id"] for d in docs], kept_out["profile_quality"]
 
     def test_blocked_legends_take_no_place_and_ready_ones_past_the_limit_are_reached(self) -> None:
         scholars = [_legend(f"blocked-{n}", "needs_data_repair", 20) for n in range(3)]
@@ -1039,6 +1065,258 @@ class PersonaCheckTests(unittest.TestCase):
 
         self.assertEqual(story_eval._first_person_hits("The US and U.S. sanctions; USA. https://x.org/us/a"), 0)
         self.assertEqual(story_eval._first_person_hits("We think our case is ours; join us."), 4)
+
+
+def _reply(text, finish="STOP"):
+    """A model reply as the Vertex SDK shapes it: text and a finish reason."""
+    return types.SimpleNamespace(text=text, candidates=[types.SimpleNamespace(finish_reason=types.SimpleNamespace(name=finish))])
+
+
+WHOLE_VERSION = {key: f"{key} text" for key in personalize.VARIANT_SCHEMA["required"]}
+CUT_OFF = '{"title": "River watch", "glossary": [{"term": "gauge", "definition": "a meter"}, {"term": "silt'
+
+
+class StructuredCallTests(unittest.TestCase):
+    """2026-11-01: two grade 6-8 versions came back as 21 and 23 words with
+    every field missing: a reply cut off at the token limit, of which one
+    glossary entry still parsed, taken as the whole version, and the
+    disclosure line put in front of its empty article."""
+
+    def _call(self, *replies):
+        import daily_story_worker as worker_module
+
+        worker = _story_worker()
+        worker.vertex_model = mock.Mock()
+        worker.vertex_model.generate_content.side_effect = list(replies)
+        with mock.patch.object(worker_module, "GenerationConfig", side_effect=lambda **kw: kw), \
+                mock.patch.object(worker_module.time, "sleep"):
+            try:
+                return worker._call_structured_json("prompt", personalize.VARIANT_SCHEMA, 5200), worker
+            except RuntimeError as exc:
+                return exc, worker
+
+    @staticmethod
+    def _budgets(worker):
+        return [c.kwargs["generation_config"]["max_output_tokens"] for c in worker.vertex_model.generate_content.call_args_list]
+
+    def test_a_reply_cut_off_at_the_limit_is_not_the_answer_and_the_retry_gets_more_room(self) -> None:
+        payload, worker = self._call(_reply(CUT_OFF, "MAX_TOKENS"), _reply(json.dumps(WHOLE_VERSION)))
+        self.assertEqual(payload, WHOLE_VERSION)
+        self.assertEqual(self._budgets(worker), [8192, 16384])
+
+    def test_a_reply_with_no_text_at_all_still_gets_more_room(self) -> None:
+        class ThoughtOnly:
+            """What the SDK returns when a thinking model spent the budget thinking."""
+            candidates = [types.SimpleNamespace(finish_reason=types.SimpleNamespace(name="MAX_TOKENS"), content=None)]
+
+            @property
+            def text(self):
+                raise ValueError("Cannot get the response text: the candidate has no parts.")
+
+        payload, worker = self._call(ThoughtOnly(), _reply(json.dumps(WHOLE_VERSION)))
+        self.assertEqual(payload, WHOLE_VERSION)
+        self.assertEqual(self._budgets(worker), [8192, 16384])
+
+    def test_only_incomplete_replies_fail_with_the_reason(self) -> None:
+        error, worker = self._call(*[_reply(CUT_OFF, "MAX_TOKENS")] * 3)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("incomplete reply, missing title", str(error).replace("summary, ", ""))
+        self.assertIn("finish_reason=MAX_TOKENS", str(error))
+        self.assertEqual(self._budgets(worker), [8192, 16384, 32768])
+        # A complete reply that stopped normally needs no more room.
+        error, worker = self._call(_reply('{"title": "x"}'), _reply(json.dumps(WHOLE_VERSION)))
+        self.assertEqual(self._budgets(worker), [8192, 8192])
+
+
+ARTICLE = """# A Legend on the News
+
+Opening paragraph that sets the scene [chunk:c1].
+
+## Historical Background
+
+Background drawn from the legend's work [chunk:c1]. More background.
+
+## What to Watch Next
+
+What comes next in the news, with no citation at all.
+
+A second paragraph, also uncited.
+
+## Sources
+
+- https://example.org/a
+"""
+
+
+class SectionRepairTests(unittest.TestCase):
+    """2026-11-01: all four failed drafts failed for want of a citation in
+    their closing sections, the whole-article repair did not fix them, and the
+    template that replaced each one was rejected. Those sections are now
+    rewritten on their own first."""
+
+    REPAIRED = "In her 1961 study, the legend traced the same pattern [chunk:c2].\n\nA second paragraph on what to watch [chunk:c1]."
+
+    def test_the_headings_named_by_citation_errors_in_order(self) -> None:
+        worker = _story_worker()
+        errors = [
+            "section_citation_end_loaded:Conclusion",
+            "insufficient_concrete_details",
+            "section_missing_citation:What to Watch Next",
+            "section_weak_citation_grounding:Conclusion",
+        ]
+        self.assertEqual(worker._sections_failing_citations(errors), ["Conclusion", "What to Watch Next"])
+
+    def test_only_the_named_sections_are_replaced(self) -> None:
+        worker = _story_worker()
+        rebuilt, replaced = worker._replace_section_bodies(ARTICLE, {"What to Watch Next": self.REPAIRED, "Nowhere": "x"})
+        self.assertEqual(replaced, ["What to Watch Next"])
+        sections = {s["heading"]: s["text"] for s in worker._extract_markdown_sections(rebuilt)}
+        self.assertEqual(sections["What to Watch Next"], self.REPAIRED)
+        self.assertEqual(sections["Historical Background"], "Background drawn from the legend's work [chunk:c1]. More background.")
+        self.assertIn("- https://example.org/a", sections["Sources"])
+
+    def test_one_model_call_rewrites_the_failing_sections_from_the_legend_s_passages(self) -> None:
+        worker = _story_worker()
+        judge = mock.Mock(return_value={"sections": [
+            {"heading": "What to Watch Next", "markdown": "## What to Watch Next\n" + self.REPAIRED},
+            {"heading": "Historical Background", "markdown": "not asked for"},
+        ]})
+        chunks = [{"chunk_id": "c1", "text": "Passage one."}, {"chunk_id": "c2", "text": "Her 1961 study."}]
+        with mock.patch.object(worker, "_call_structured_json", judge):
+            repaired = worker._repair_section_citations(
+                name="Derrick Bell",
+                payload={"article_markdown": ARTICLE, "title": "t"},
+                errors=["section_missing_citation:What to Watch Next", "section_missing_citation:Introduction"],
+                context_chunks=chunks,
+                trend_issue={**KENYA, "article_text": "The strike ended on Monday."},
+            )
+        prompt = judge.call_args.args[0]
+        self.assertIn("[chunk:c2] Her 1961 study.", prompt)
+        self.assertIn("The strike ended on Monday.", prompt)
+        self.assertIn("### What to Watch Next\nWhat comes next in the news", prompt)
+        self.assertNotIn("### Introduction", prompt, "the text before the first heading is the whole-article repair's")
+        sections = {s["heading"]: s["text"] for s in worker._extract_markdown_sections(repaired["article_markdown"])}
+        self.assertEqual(sections["What to Watch Next"], self.REPAIRED, "the repeated heading is dropped")
+        self.assertEqual(sections["Historical Background"], "Background drawn from the legend's work [chunk:c1]. More background.")
+        self.assertEqual(repaired["title"], "t")
+        with mock.patch.object(worker, "_call_structured_json", mock.Mock(return_value={"sections": []})):
+            self.assertIsNone(worker._repair_section_citations(
+                name="Derrick Bell", payload={"article_markdown": ARTICLE},
+                errors=["section_missing_citation:What to Watch Next"], context_chunks=chunks, trend_issue=None,
+            ))
+
+    def test_a_run_keeps_the_section_repair_when_it_passes(self) -> None:
+        worker = _story_worker(scholars=[{"profile_id": "legend-0", "professor_name": "Derrick Bell"}])
+        worker.use_llm = True
+        fixed = ARTICLE.replace("What comes next in the news, with no citation at all.", "What comes next [chunk:c1].")
+
+        def validate(**kwargs):
+            article = kwargs["payload"]["article_markdown"]
+            if "What comes next [chunk:c1]." in article:
+                return True, [], [], ["c1"], [], ""
+            return False, ["section_missing_citation:What to Watch Next"], [], ["c1"], [], ""
+
+        def model(prompt, schema, max_tokens):
+            if "SECTIONS TO REVISE" in prompt:
+                return {"sections": [{"heading": "What to Watch Next", "markdown": "What comes next [chunk:c1].\n\nAnd more [chunk:c1]."}]}
+            return _fake_judge({KENYA["title"]: "strong"})(prompt, schema, max_tokens)
+
+        draft = {"title": "A Legend on the News", "article_markdown": ARTICLE, "editor_notes": []}
+        _run_day(
+            worker,
+            dry_run=False,
+            _call_structured_json=mock.Mock(side_effect=model),
+            _generate_story_payload=mock.Mock(return_value=dict(draft)),
+            _validate_story=mock.Mock(side_effect=validate),
+            _call_llm_json=mock.Mock(side_effect=AssertionError("the whole-article repair is not needed")),
+        )
+        [story] = worker.stories_collection.docs
+        self.assertNotEqual(story["status"], "failed_validation")
+        self.assertIn("section_citation_repair", story["generation"]["editor_notes"])
+
+
+class VersionRepairTests(unittest.TestCase):
+    """Reading versions: the disclosure line the code adds is not counted
+    against the model's word limit, an empty version is not dressed up with
+    it, and a complete version that fails only on length, level or counts is
+    revised rather than written again."""
+
+    DISCLOSURE = "AI-generated perspective inspired by the published scholarship of Phyllis Ann Wallace. This is not a real article written by Phyllis Ann Wallace."
+    SENTENCE = "The historian studied the records carefully, and her findings changed how the community understood its own history. "
+
+    def _version(self, sentences):
+        return {
+            "title": "What the records show",
+            "summary": "A historian's findings.",
+            "article_markdown": self.SENTENCE * sentences,
+            "glossary": [{"term": "historian", "definition": "d"}, {"term": "community", "definition": "d"}, {"term": "records", "definition": "d"}],
+            "key_takeaways": ["a", "b", "c"],
+            "comprehension_questions": [{"question": "q1", "answer_guidance": "g"}, {"question": "q2", "answer_guidance": "g"}, {"question": "q3", "answer_guidance": "g"}],
+            "teacher_note": "Discuss the records.",
+            "used_evidence_ids": ["a"],
+        }
+
+    def test_an_empty_version_stays_empty(self) -> None:
+        story = {"content": {"disclosure": self.DISCLOSURE}}
+        empty = personalize._coerce_variant({"term": "gauge", "definition": "a meter"})
+        self.assertFalse(personalize._preserve_canonical_disclosure(story, empty))
+        self.assertEqual(empty["article_markdown"], "")
+        blockers, _ = personalize._validate_variant(empty, "grade_6_8", {"a"}, self.DISCLOSURE)
+        self.assertIn("missing_article_markdown", blockers)
+
+    def test_the_disclosure_line_is_not_counted_against_the_limit(self) -> None:
+        story = {"content": {"disclosure": self.DISCLOSURE}}
+        version = self._version(82)  # 1,394 words: inside grade 9-12's 1,400
+        personalize._preserve_canonical_disclosure(story, version)
+        self.assertTrue(version["article_markdown"].startswith(f"> {self.DISCLOSURE}"))
+        blockers, metrics = personalize._validate_variant(version, "grade_9_12", {"a"}, self.DISCLOSURE)
+        self.assertEqual((blockers, metrics["word_count"]), ([], 1394))
+        counted, _ = personalize._validate_variant(version, "grade_9_12", {"a"})
+        self.assertEqual(counted, ["word_count_out_of_range:1417"], "as it was measured before")
+
+    def test_what_a_revision_can_fix(self) -> None:
+        version = self._version(90)
+        self.assertTrue(personalize._revisable(version, ["word_count_out_of_range:1530", "average_sentence_too_long:24.0"]))
+        self.assertFalse(personalize._revisable(version, ["word_count_out_of_range:1530", "adds an unsupported claim"]))
+        self.assertFalse(personalize._revisable({**version, "title": ""}, ["word_count_out_of_range:1530"]))
+        self.assertFalse(personalize._revisable(version, []))
+        fixes = personalize._revision_fixes("grade_9_12", version["article_markdown"], ["word_count_out_of_range:1530"])
+        self.assertEqual(fixes, ["The article has 1530 words; the most is 1400. Cut it to about 1260 words by removing repetition and the least important details. Add nothing."])
+
+    def test_a_version_over_its_limit_is_revised_not_written_again(self) -> None:
+        story = {
+            **STORY,
+            "content": {**STORY["content"], "disclosure": self.DISCLOSURE},
+            "citations": [{"chunk_id": "a", "evidence_excerpt": "The historian's study of the records."}],
+        }
+        prompts = []
+
+        def model(worker, prompt, schema, max_tokens):
+            prompts.append(prompt.split("\n", 1)[0])
+            if prompt.startswith("Validate this student editorial adaptation"):
+                return {"ok": True, "blockers": [], "notes": []}
+            if "suitable" in json.dumps(schema):
+                return {"suitable": True, "reason": "Fine for this age."}
+            if prompt.startswith("Revise this"):
+                self.assertIn("The article has 1530 words; the most is 1400.", prompt)
+                self.assertNotIn(self.DISCLOSURE, prompt.split("The version to revise (JSON):", 1)[1].split("Canonical title:", 1)[0])
+                return self._version(60)
+            return self._version(90)
+
+        worker = FakeWorker()
+        worker.stories_collection = FakeCollection([story])
+        with mock.patch.object(personalize, "DailyStoryWorker", return_value=worker), \
+                mock.patch.object(personalize, "resolve_active_audience", return_value={"band_keys": ["grade_9_12"]}), \
+                mock.patch.object(personalize, "_call_structured", side_effect=model):
+            result = personalize.run_personalization(story_date="2026-11-01", max_stories=5, dry_run=False, no_llm=False)
+        self.assertEqual((result["summary"]["generated"], result["summary"]["failed"]), (1, 0))
+        self.assertEqual([p for p in prompts if not p.startswith(("Validate", "You "))], [
+            "Adapt a grounded editorial for Grades 9 to 12.",
+            "Revise this Grades 9 to 12 version of a grounded editorial so it meets its contract.",
+        ])
+        [variant] = worker.stories_collection.updates[0][1]["$set"]["audience_variants"]
+        self.assertEqual(variant["status"], "ready")
+        self.assertEqual(variant["readability"]["word_count"], 1020)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover
     BeautifulSoup = None  # type: ignore
 
 from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
+import legend_identity
 
 try:
     from pymongo.errors import DuplicateKeyError
@@ -277,6 +278,38 @@ ARTICLE_TOTAL_SECONDS = 25
 ARTICLE_MAX_REDIRECTS = 3
 ARTICLE_MAX_BYTES = 3_000_000
 ARTICLE_TEXT_MAX_CHARS = 8000
+
+# A structured call cut off at its token limit retries with twice the budget,
+# up to this (see DailyStoryWorker._call_structured_json).
+STRUCTURED_MAX_TOKENS_CEILING = 32768
+
+# A draft whose sections fail only for want of a grounded citation has those
+# sections rewritten on their own, before any whole-article repair: on
+# 2026-11-01 all four failed drafts failed this way, in their closing
+# sections ("Why This Matters Now", "What to Watch Next"), the whole-article
+# repair did not fix them, and the template that replaced them was rejected.
+SECTION_CITATION_ERROR_PREFIXES = (
+    "section_missing_citation:",
+    "section_citation_end_loaded:",
+    "section_unknown_or_missing_citations:",
+    "section_weak_citation_grounding:",
+    "section_missing_early_strong_citation:",
+)
+SECTION_REPAIR_MAX_SECTIONS = 4
+SECTION_REPAIR_SCHEMA: Dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "sections": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {"heading": {"type": "STRING"}, "markdown": {"type": "STRING"}},
+                "required": ["heading", "markdown"],
+            },
+        },
+    },
+    "required": ["sections"],
+}
 ARTICLE_TEXT_MIN_CHARS = 600
 ARTICLE_MIN_PARAGRAPH_CHARS = 40
 ARTICLE_HTML_TYPES = ("text/html", "application/xhtml+xml")
@@ -3058,28 +3091,37 @@ Today's events:
         cursor = self.scholars_collection.find({}).limit(max_scholars)
         return list(cursor)
 
-    def _story_candidates(self, story_date: str, max_scholars: int) -> Tuple[List[Dict[str, Any]], int]:
-        """The legends a run writes for, and how many the profile-quality gate
-        kept out.
+    def _story_candidates(self, story_date: str, max_scholars: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """The legends a run writes for, and how many each gate kept out
+        ({"profile_quality": n, "identity": n}).
 
         A run once took the first max_scholars legends in collection order,
         ready or not, so every night the same 25 were tried: on 2026-11-01, 19
         of them were blocked by the gate while 23 ready legends further down
-        were never reached. Now only legends that pass the gate are candidates,
-        the least recently written first (a story that failed does not count
-        as written), with ties in an order that changes from day to day.
+        were never reached. Now only legends that pass the gates are
+        candidates: the profile-quality gate, and an identity review whose
+        verdict lets the legend be written about (legend_identity; whether
+        that review still matches the stored sources is checked on the whole
+        legend in run). The least recently written go first (a story that
+        failed does not count as written), with ties in an order that changes
+        from day to day.
         """
-        excluded = 0
+        kept_out = {"profile_quality": 0, "identity": 0}
         eligible: List[Tuple[str, Any]] = []
-        for doc in self.scholars_collection.find({}, {"_id": 1, "profile_id": 1, "daily_story_profile": 1}):
+        projection = {"_id": 1, "profile_id": 1, "daily_story_profile": 1, "identity_review.eligible": 1, "identity_review.policy_version": 1}
+        for doc in self.scholars_collection.find({}, projection):
             profile_id = self._profile_id(doc)
             if not profile_id:
                 continue
             ready, _, _ = self._profile_quality_state(doc)
-            if ready:
-                eligible.append((profile_id, doc["_id"]))
-            else:
-                excluded += 1
+            if not ready:
+                kept_out["profile_quality"] += 1
+                continue
+            review = doc.get("identity_review") or {}
+            if review.get("eligible") is not True or review.get("policy_version") != legend_identity.IDENTITY_POLICY_VERSION:
+                kept_out["identity"] += 1
+                continue
+            eligible.append((profile_id, doc["_id"]))
 
         last_written: Dict[str, str] = {}
         for row in self.stories_collection.aggregate([
@@ -3093,9 +3135,22 @@ Today's events:
             shuffle = hashlib.sha256(f"{story_date}:{profile_id}".encode("utf-8")).hexdigest()
             return last_written.get(profile_id, ""), shuffle
 
-        chosen = sorted(eligible, key=turn)[:max_scholars]
-        docs = [self.scholars_collection.find_one({"_id": _id}) for _, _id in chosen]
-        return [doc for doc in docs if doc], excluded
+        # In turn order, until max_scholars legends whose review still applies
+        # to their stored sources: a stale one (its sources changed and its
+        # re-review failed) would otherwise lead the queue every night and
+        # take a slot only to be skipped.
+        docs: List[Dict[str, Any]] = []
+        for _, _id in sorted(eligible, key=turn):
+            if len(docs) >= max_scholars:
+                break
+            doc = self.scholars_collection.find_one({"_id": _id})
+            if not doc:
+                continue
+            if not legend_identity.story_eligibility(doc)[0]:
+                kept_out["identity"] += 1
+                continue
+            docs.append(doc)
+        return docs, kept_out
 
     def _extract_context_chunks(
         self,
@@ -3529,7 +3584,12 @@ Allowed chunk IDs (must be copied exactly):
 
     @staticmethod
     def _flatten_vertex_text(response: Any) -> str:
-        direct = safe_text(getattr(response, "text", ""))
+        # The SDK's .text raises ValueError when a candidate has no text part:
+        # a thinking model that spent its whole budget thinking, for one.
+        try:
+            direct = safe_text(getattr(response, "text", ""))
+        except ValueError:
+            direct = ""
         if direct:
             return direct
 
@@ -3735,14 +3795,33 @@ Malformed output:
             f"content_preview={content_preview or 'empty'}"
         )
 
+    @staticmethod
+    def _finish_reason(response: Any) -> str:
+        """The first candidate's finish reason by name ("MAX_TOKENS", "STOP"), or ""."""
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return ""
+        reason = getattr(candidates[0], "finish_reason", None)
+        return safe_text(getattr(reason, "name", None) or reason).upper()
+
     def _call_structured_json(self, prompt: str, schema: Dict[str, Any], max_tokens: int) -> Dict[str, Any]:
         """One JSON object from the model for a judge's prompt: schema-bound
         first, then plain JSON, then free text (as the personalisation stage
-        calls it). Raises when the model gives nothing usable."""
+        calls it). Raises when the model gives nothing usable.
+
+        Only a whole reply is used: one missing any of the schema's required
+        top-level fields is a failed attempt. A reply cut off at the token
+        limit is unfinished JSON, from which an inner object (one glossary
+        entry, say) can still be parsed; taken as the answer, it made reading
+        versions of ~22 words, the disclosure line and nothing else
+        (2026-11-01). An attempt cut off at the limit retries with twice the
+        budget, up to STRUCTURED_MAX_TOKENS_CEILING."""
         if not self.vertex_model or GenerationConfig is None:
             raise RuntimeError("Vertex model is not available")
+        required = [key for key in (schema.get("required") or []) if isinstance(key, str)]
         last_error: Optional[Exception] = None
         last_content = ""
+        last_finish = ""
         # Thinking models spend from the same budget.
         token_budget = max(8192, max_tokens)
         for attempt, (temperature, enforce_schema, enforce_json) in enumerate((
@@ -3768,15 +3847,24 @@ Malformed output:
                     config = GenerationConfig(temperature=temperature, max_output_tokens=token_budget)
                 response = self.vertex_model.generate_content(prompt, generation_config=config)
                 last_content = self._flatten_vertex_text(response)
+                last_finish = self._finish_reason(response)
                 parsed = self._extract_json_object(last_content)
-                if isinstance(parsed, dict):
+                missing = [key for key in required if not isinstance(parsed, dict) or key not in parsed]
+                if isinstance(parsed, dict) and not missing:
                     return parsed
-                last_error = RuntimeError("model returned invalid JSON")
+                last_error = RuntimeError(
+                    "model returned invalid JSON" if not isinstance(parsed, dict)
+                    else f"incomplete reply, missing {', '.join(missing)}"
+                )
+                if "MAX_TOKENS" in last_finish:
+                    token_budget = min(token_budget * 2, STRUCTURED_MAX_TOKENS_CEILING)
             except Exception as exc:  # pragma: no cover - external SDK behaviour
                 last_error = exc
                 time.sleep(1.25 * (2 ** attempt))
         preview = re.sub(r"\s+", " ", safe_text(last_content))[:200]
-        raise RuntimeError(f"structured call failed: {last_error}; content_preview={preview or 'empty'}")
+        raise RuntimeError(
+            f"structured call failed: {last_error}; finish_reason={last_finish or 'n/a'}; content_preview={preview or 'empty'}"
+        )
 
     def _build_llm_failure_fallback_payload(
         self,
@@ -4271,6 +4359,134 @@ Malformed output:
                 allowed_source_urls=allowed_source_urls,
                 error_note=f"llm_generation_error:{safe_text(exc)}",
             )
+
+    @staticmethod
+    def _sections_failing_citations(errors: List[str]) -> List[str]:
+        """The headings named by section-level citation errors, in order."""
+        headings: List[str] = []
+        for error in errors:
+            for prefix in SECTION_CITATION_ERROR_PREFIXES:
+                if error.startswith(prefix):
+                    heading = error[len(prefix):].strip()
+                    if heading and heading not in headings:
+                        headings.append(heading)
+        return headings
+
+    @staticmethod
+    def _replace_section_bodies(article_markdown: str, bodies: Dict[str, str]) -> Tuple[str, List[str]]:
+        """The article with the text under each named heading (## to ####, as
+        _extract_markdown_sections reads them) replaced by bodies[heading];
+        the first section of each name only. Returns (article, headings replaced)."""
+        out: List[str] = []
+        replaced: List[str] = []
+        skipping = False
+        for raw in safe_text(article_markdown).splitlines():
+            match = re.match(r"^#{2,4}\s+(.*)$", raw.strip())
+            if match:
+                skipping = False
+                out.append(raw)
+                heading = match.group(1).strip()
+                if heading in bodies and heading not in replaced:
+                    out.extend(["", *bodies[heading].strip().splitlines(), ""])
+                    replaced.append(heading)
+                    skipping = True
+                continue
+            if not skipping:
+                out.append(raw)
+        return "\n".join(out), replaced
+
+    def _section_repair_prompt(
+        self,
+        *,
+        name: str,
+        sections: List[Tuple[str, str]],
+        context_chunks: List[Dict[str, Any]],
+        trend_issue: Optional[Dict[str, Any]],
+    ) -> str:
+        passages = "\n\n".join(
+            f"[chunk:{safe_text(c.get('chunk_id'))}] {safe_text(c.get('text'))[:1200]}"
+            for c in context_chunks
+            if safe_text(c.get("chunk_id"))
+        )
+        issue = trend_issue or {}
+        article_text = safe_text(issue.get("article_text"))[:3000]
+        news = "\n".join(
+            part for part in (
+                f"Headline: {safe_text(issue.get('title'))}" if safe_text(issue.get("title")) else "",
+                f"Summary: {safe_text(issue.get('summary'))}" if safe_text(issue.get("summary")) else "",
+                f'Article text:\n"""\n{article_text}\n"""' if article_text else "",
+            ) if part
+        ) or "None."
+        blocks = "\n\n".join(f"### {heading}\n{body}" for heading, body in sections)
+        return f"""You revise sections of an AI-written article on a news event, seen through the published work of {name}, a scholar our students study.
+Each section below failed one check: a section must be grounded in {name}'s passages, with an inline citation such as [chunk:ID] in its first paragraph, citing the passage it draws on.
+
+Rewrite only these sections. For each:
+- Keep the section's point, and its claims about the news event, which rest on the news item below.
+- Tie the section to {name}'s work through the passages below: in its first paragraph, restate in your own words something specific from a passage (a work, an idea, a finding, a date) and cite it right after as [chunk:ID]. Cite again wherever you draw on a passage later.
+- Cite only the IDs listed below. Add no fact that is not in the passages or the news item.
+- Keep at least two paragraphs and about the same length. Write about {name} in the third person, and never use "we", "our" or "us".
+- Return the section's text without its heading.
+
+{name.upper()}'S PASSAGES
+{passages}
+
+THE NEWS ITEM
+{news}
+
+SECTIONS TO REVISE
+{blocks}
+
+Return JSON: {{"sections": [{{"heading": "<the heading exactly as given>", "markdown": "<the revised section text>"}}]}}"""
+
+    def _repair_section_citations(
+        self,
+        *,
+        name: str,
+        payload: Dict[str, Any],
+        errors: List[str],
+        context_chunks: List[Dict[str, Any]],
+        trend_issue: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """The draft with only the sections that failed for want of a citation
+        rewritten (at most SECTION_REPAIR_MAX_SECTIONS, one model call), or
+        None when there is nothing it can rewrite. The text before the first
+        heading is left to the whole-article repair."""
+        article = safe_text(payload.get("article_markdown"))
+        present = {
+            match.group(1).strip()
+            for match in re.finditer(r"^\s*#{2,4}\s+(.*)$", article, flags=re.M)
+        }
+        bodies_now = {s["heading"]: s["text"] for s in self._extract_markdown_sections(article)}
+        targets = [
+            (heading, bodies_now[heading])
+            for heading in self._sections_failing_citations(errors)
+            if heading in present and heading in bodies_now
+        ][:SECTION_REPAIR_MAX_SECTIONS]
+        if not targets:
+            return None
+        reply = self._call_structured_json(
+            self._section_repair_prompt(name=name, sections=targets, context_chunks=context_chunks, trend_issue=trend_issue),
+            SECTION_REPAIR_SCHEMA,
+            8192,
+        )
+        wanted = {heading for heading, _ in targets}
+        bodies: Dict[str, str] = {}
+        for row in reply.get("sections") or []:
+            if not isinstance(row, dict):
+                continue
+            heading = safe_text(row.get("heading"))
+            body = safe_text(row.get("markdown"))
+            if body.startswith("#"):
+                body = body.split("\n", 1)[1].strip() if "\n" in body else ""
+            if heading in wanted and body and heading not in bodies:
+                bodies[heading] = body
+        if not bodies:
+            return None
+        rebuilt, replaced = self._replace_section_bodies(article, bodies)
+        if not replaced:
+            return None
+        return {**payload, "article_markdown": rebuilt}
 
     def _repair_story_payload(
         self,
@@ -5843,6 +6059,7 @@ Return only JSON.
                 "generated": 0,
                 "skipped_existing": 0,
                 "skipped_profile_quality": 0,
+                "skipped_identity": 0,
                 "skipped_no_fresh_trend": 0,
                 "skipped_no_relevant_trend": 0,
                 "degraded_no_trend_data": 0,
@@ -5855,20 +6072,21 @@ Return only JSON.
         }
         self.jobs_collection.insert_one(run_doc)
 
-        excluded_for_quality = 0
+        kept_out = {"profile_quality": 0, "identity": 0}
         if scholar_id:
             scholars = list(self._iter_scholars(scholar_id=scholar_id, max_scholars=max_scholars))
         else:
-            scholars, excluded_for_quality = self._story_candidates(story_date, max_scholars)
+            scholars, kept_out = self._story_candidates(story_date, max_scholars)
         if not scholars:
-            error = "no_ready_scholars" if excluded_for_quality else "no_scholars_found"
+            error = "no_ready_scholars" if any(kept_out.values()) else "no_scholars_found"
             self.jobs_collection.update_one(
                 {"run_id": run_id},
                 {
                     "$set": {
                         "ended_at": utc_now_iso(),
                         "status": "failed",
-                        "summary.skipped_profile_quality": excluded_for_quality,
+                        "summary.skipped_profile_quality": kept_out["profile_quality"],
+                        "summary.skipped_identity": kept_out["identity"],
                         "errors": [error],
                     }
                 },
@@ -5876,7 +6094,8 @@ Return only JSON.
             return {"run_id": run_id, "status": "failed", "error": error}
 
         summary = run_doc["summary"]
-        summary["skipped_profile_quality"] = excluded_for_quality
+        summary["skipped_profile_quality"] = kept_out["profile_quality"]
+        summary["skipped_identity"] = kept_out["identity"]
         all_errors: List[str] = []
         trending_issues = self._fetch_trending_issues()
         self.jobs_collection.update_one(
@@ -5918,6 +6137,16 @@ Return only JSON.
                     f"{profile_id}:profile_quality_blocked:{profile_quality_status}:{profile_quality_score}"
                 )
                 continue
+
+            # Written about only while an identity review of these very
+            # sources lets it be, and only from the pages it ruled are about
+            # the legend (legend_identity).
+            identity_ok, identity_reason = legend_identity.story_eligibility(scholar_doc)
+            if not identity_ok:
+                summary["skipped_identity"] += 1
+                all_errors.append(f"{profile_id}:identity_blocked:{identity_reason}")
+                continue
+            scholar_doc = legend_identity.restricted_to_reviewed_sources(scholar_doc)
 
             # With every event at its daily cap or already covered by this
             # legend, the legend sits the day out rather than repeat an event.
@@ -6063,6 +6292,55 @@ Return only JSON.
                         if not isinstance(notes, list):
                             notes = []
                         notes.append("deterministic_reliability_patch")
+                        payload["editor_notes"] = notes
+
+            # Sections failing only for want of a grounded citation are
+            # rewritten on their own first (SECTION_CITATION_ERROR_PREFIXES).
+            if (not valid) and self.use_llm and (not dry_run) and self._sections_failing_citations(errors):
+                try:
+                    section_payload = self._repair_section_citations(
+                        name=professor_name,
+                        payload=payload,
+                        errors=errors,
+                        context_chunks=context_chunks,
+                        trend_issue=trend_issue,
+                    )
+                except Exception:
+                    section_payload = None
+                    warnings.append("section_repair_failed")
+                if section_payload:
+                    section_payload, _ = self._enforce_source_url_citations(
+                        payload=section_payload,
+                        allowed_source_urls=allowed_source_urls,
+                    )
+                    (
+                        s_valid,
+                        s_errors,
+                        s_warnings,
+                        s_used_chunk_ids,
+                        s_claim_map,
+                        s_trend_source_url,
+                    ) = self._validate_story(
+                        name=professor_name,
+                        payload=section_payload,
+                        context_chunks=context_chunks,
+                        trend_issue=trend_issue,
+                        allowed_source_urls=allowed_source_urls,
+                        allowed_chunk_ids=allowed_chunk_ids,
+                        assume_deceased=self.assume_deceased,
+                    )
+                    if s_valid or len(s_errors) < len(errors):
+                        payload = section_payload
+                        valid = s_valid
+                        errors = s_errors
+                        warnings = s_warnings
+                        used_chunk_ids = s_used_chunk_ids
+                        normalized_claim_map = s_claim_map
+                        trend_source_url = s_trend_source_url
+                        notes = payload.get("editor_notes")
+                        if not isinstance(notes, list):
+                            notes = []
+                        notes.append("section_citation_repair")
                         payload["editor_notes"] = notes
 
             if (not valid) and self.use_llm and (not dry_run):

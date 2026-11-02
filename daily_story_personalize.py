@@ -12,18 +12,18 @@ import hashlib
 import json
 import os
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from daily_story_worker import DailyStoryWorker, GenerationConfig, parse_date, safe_text, utc_now_iso
+from daily_story_worker import DailyStoryWorker, parse_date, safe_text, utc_now_iso
 
 
 AUDIENCE_CONTRACT_VERSION = "active-student-audience-v1"
-PROMPT_VERSION = "editorial-access-ladder-v3"
+PROMPT_VERSION = "editorial-access-ladder-v4"
 READY_COMPATIBLE_PROMPT_VERSIONS = {
     "editorial-access-ladder-v1",
     "editorial-access-ladder-v2",
+    "editorial-access-ladder-v3",
     PROMPT_VERSION,
 }
 MAX_TOTAL_GENERATION_ATTEMPTS = max(1, int(os.getenv("EDITORIAL_PERSONALIZATION_MAX_TOTAL_ATTEMPTS", "9")))
@@ -288,59 +288,44 @@ def _coerce_variant(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _preserve_canonical_disclosure(story: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+    """Puts the canonical story's AI disclosure at the top of the version's
+    article. An empty article stays empty: given the disclosure alone, a
+    version the model never wrote read as a 22-word article (2026-11-01)."""
     disclosure = safe_text((story.get("content") or {}).get("disclosure"))
     article = safe_text(candidate.get("article_markdown"))
-    if not disclosure or disclosure.lower() in article.lower():
+    if not disclosure or not article or disclosure.lower() in article.lower():
         return False
     candidate["article_markdown"] = f"> {disclosure}\n\n{article}".strip()
     return True
 
 
+def _without_disclosure(article: Any, disclosure: str) -> str:
+    """The version's article without the disclosure line the code put at its
+    top: the reading measures and word counts are of what the model wrote,
+    the boilerplate disclosure (~22 words) not counted against its limit."""
+    text = safe_text(article)
+    disclosure = safe_text(disclosure)
+    if not disclosure:
+        return text
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lstrip(">").strip().lower() == disclosure.lower():
+            return "\n".join(lines[index + 1:]).strip()
+        break
+    return text
+
+
 def _call_structured(worker: DailyStoryWorker, prompt: str, schema: Dict[str, Any], max_tokens: int) -> Dict[str, Any]:
-    if not worker.vertex_model or GenerationConfig is None:
-        raise RuntimeError("Vertex model is not available for editorial personalization")
-    last_error: Optional[Exception] = None
-    last_finish_hint = ""
-    last_content = ""
-    token_budget = max(8192, max_tokens)
-    for attempt, (temperature, enforce_schema, enforce_json) in enumerate((
-        (0.15, True, True),
-        (0.05, False, True),
-        (0.0, False, False),
-    )):
-        try:
-            if enforce_schema:
-                config = GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=token_budget,
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                )
-            elif enforce_json:
-                config = GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=token_budget,
-                    response_mime_type="application/json",
-                )
-            else:
-                config = GenerationConfig(temperature=temperature, max_output_tokens=token_budget)
-            response = worker.vertex_model.generate_content(prompt, generation_config=config)
-            last_content = worker._flatten_vertex_text(response)
-            candidates = getattr(response, "candidates", None) or []
-            if candidates:
-                last_finish_hint = safe_text(getattr(candidates[0], "finish_reason", ""))
-            parsed = worker._extract_json_object(last_content)
-            if isinstance(parsed, dict):
-                return parsed
-            last_error = RuntimeError("model returned invalid JSON")
-        except Exception as exc:  # pragma: no cover - external SDK behavior
-            last_error = exc
-            time.sleep(1.25 * (2 ** attempt))
-    preview = re.sub(r"\s+", " ", safe_text(last_content))[:240]
-    raise RuntimeError(
-        f"Structured personalization call failed: {last_error}; "
-        f"finish_reason={last_finish_hint or 'n/a'}; content_preview={preview or 'empty'}"
-    )
+    """One whole JSON object from the model (DailyStoryWorker._call_structured_json:
+    a reply missing any required field, such as the remains of one cut off at
+    the token limit, is never taken as the answer)."""
+    try:
+        return worker._call_structured_json(prompt, schema, max_tokens)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Structured personalization call failed: {exc}") from exc
 
 
 def _evidence_rows(story: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -392,7 +377,127 @@ Allowed evidence excerpts:
 """
 
 
-def _validate_variant(variant: Dict[str, Any], band_key: str, allowed_ids: set[str]) -> Tuple[List[str], Dict[str, Any]]:
+# Blockers a complete version can be revised out of, keeping the version: its
+# length, reading level and counts. Anything else (a missing field, a model
+# verifier's finding) is written again from the canonical article.
+REVISABLE_BLOCKER_PREFIXES = (
+    "word_count_out_of_range:",
+    "readability_out_of_range:",
+    "average_sentence_too_long:",
+    "glossary_count_out_of_range",
+    "glossary_term_missing_from_article:",
+    "takeaway_count_out_of_range",
+    "question_count_out_of_range",
+)
+
+
+def _story_disclosure(story: Dict[str, Any]) -> str:
+    return safe_text((story.get("content") or {}).get("disclosure"))
+
+
+def _revisable(candidate: Dict[str, Any], blockers: List[str]) -> bool:
+    """Whether the next attempt revises this version rather than writing a
+    new one: it is complete, and every blocker is one a revision can fix."""
+    if not blockers:
+        return False
+    if any(not safe_text(candidate.get(field)) for field in ("title", "summary", "article_markdown", "teacher_note")):
+        return False
+    return all(blocker.startswith(REVISABLE_BLOCKER_PREFIXES) for blocker in blockers)
+
+
+def _revision_fixes(band_key: str, article: str, blockers: Iterable[str]) -> List[str]:
+    """What the revision must change, in numbers the model can act on."""
+    band = GRADE_BANDS[band_key]
+    metrics = readability_metrics(article)
+    fixes: List[str] = []
+    for blocker in blockers:
+        if blocker.startswith("word_count_out_of_range:"):
+            words = metrics["word_count"]
+            if words > band["max_words"]:
+                fixes.append(
+                    f"The article has {words} words; the most is {band['max_words']}. Cut it to about "
+                    f"{int(band['max_words'] * 0.9)} words by removing repetition and the least important details. Add nothing."
+                )
+            else:
+                fixes.append(
+                    f"The article has {words} words; the least is {band['min_words']}. Expand it to about "
+                    f"{int(band['min_words'] * 1.15)} words, using only the canonical article and the evidence excerpts."
+                )
+        elif blocker.startswith("readability_out_of_range:"):
+            grade = metrics["flesch_kincaid_grade"]
+            if grade > band["max_grade"]:
+                fixes.append(f"Its reading level measures {grade}; the most is {band['max_grade']}. Use shorter sentences and plainer words.")
+            else:
+                fixes.append(f"Its reading level measures {grade}; the least is {band['min_grade']}. Use fuller sentences and the subject's own terms, defined.")
+        elif blocker.startswith("average_sentence_too_long:"):
+            fixes.append(
+                f"Its sentences average {metrics['average_sentence_words']} words; keep the average at or under "
+                f"{band['max_sentence_words']} by splitting long sentences."
+            )
+        elif blocker.startswith("glossary_"):
+            fixes.append("Give 3 to 6 glossary terms, each a word or phrase that appears in the article exactly as written there.")
+        elif blocker.startswith("takeaway_count_out_of_range"):
+            fixes.append("Give 3 to 5 key takeaways.")
+        elif blocker.startswith("question_count_out_of_range"):
+            fixes.append("Give 3 to 5 comprehension questions, each with answer guidance.")
+    return list(dict.fromkeys(fixes))
+
+
+def _build_revision_prompt(story: Dict[str, Any], band_key: str, candidate: Dict[str, Any], blockers: Iterable[str]) -> str:
+    """Revise a complete version that failed only on length, reading level or
+    counts, instead of writing it again: a grade 9-12 version 40 words over
+    its limit (2026-11-01) needs a trim, not a new draft."""
+    band = GRADE_BANDS[band_key]
+    content = story.get("content") or {}
+    article = _without_disclosure(candidate.get("article_markdown"), _story_disclosure(story))
+    version = {
+        "title": safe_text(candidate.get("title")),
+        "summary": safe_text(candidate.get("summary")),
+        "article_markdown": article,
+        "glossary": candidate.get("glossary") or [],
+        "key_takeaways": candidate.get("key_takeaways") or [],
+        "comprehension_questions": candidate.get("comprehension_questions") or [],
+        "teacher_note": safe_text(candidate.get("teacher_note")),
+        "used_evidence_ids": candidate.get("used_evidence_ids") or [],
+    }
+    fixes = "\n".join(f"- {fix}" for fix in _revision_fixes(band_key, article, blockers)) or "- none"
+    evidence_blob = "\n".join(f"[{row['evidence_id']}] {row['excerpt']}" for row in _evidence_rows(story))
+    return f"""Revise this {band['label']} version of a grounded editorial so it meets its contract.
+Change only what the fixes below need; keep everything else as it is. Do not add facts, identities,
+motivations, examples, or advice absent from the canonical article and evidence excerpts. Do not
+impersonate the scholar.
+
+Contract:
+- {band['min_words']}-{band['max_words']} article words
+- Flesch-Kincaid estimate {band['min_grade']}-{band['max_grade']}
+- average sentence length no more than {band['max_sentence_words']} words
+- 3-6 glossary terms used in the article, 3-5 takeaways, 3-5 comprehension questions
+
+Fixes needed:
+{fixes}
+
+The version to revise (JSON):
+{json.dumps(version, ensure_ascii=False)}
+
+Canonical title: {safe_text(content.get('title'))}
+Canonical article:
+{safe_text(content.get('article_markdown'))}
+
+Allowed evidence excerpts:
+{evidence_blob}
+
+Return the whole revised version, every field, as JSON only.
+"""
+
+
+def _validate_variant(
+    variant: Dict[str, Any],
+    band_key: str,
+    allowed_ids: set[str],
+    disclosure: str = "",
+) -> Tuple[List[str], Dict[str, Any]]:
+    """The version's blockers and reading measures. The measures are of the
+    article without the disclosure line (_without_disclosure)."""
     band = GRADE_BANDS[band_key]
     blockers: List[str] = []
     for field in ("title", "summary", "article_markdown", "teacher_note"):
@@ -405,7 +510,7 @@ def _validate_variant(variant: Dict[str, Any], band_key: str, allowed_ids: set[s
     if not 3 <= len(variant.get("comprehension_questions") or []) <= 5:
         blockers.append("question_count_out_of_range")
 
-    metrics = readability_metrics(variant.get("article_markdown"))
+    metrics = readability_metrics(_without_disclosure(variant.get("article_markdown"), disclosure))
     if metrics["word_count"] < band["min_words"] or metrics["word_count"] > band["max_words"]:
         blockers.append(f"word_count_out_of_range:{metrics['word_count']}")
     if not band["min_grade"] <= metrics["flesch_kincaid_grade"] <= band["max_grade"]:
@@ -671,6 +776,7 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                             upgraded_candidate,
                             band_key,
                             allowed_ids,
+                            _story_disclosure(story),
                         )
                         if not upgrade_blockers and existing.get("status") == "ready" and (existing.get("validation") or {}).get("ok"):
                             next_variant = {
@@ -768,7 +874,7 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                         if safe_text(item.get("definition"))
                         and safe_text(item.get("term")).lower() in normalized_article
                     ]
-                    deterministic_blockers, metrics = _validate_variant(candidate, band_key, allowed_ids)
+                    deterministic_blockers, metrics = _validate_variant(candidate, band_key, allowed_ids, _story_disclosure(story))
                     verifier = {"ok": False, "blockers": [], "notes": []}
                     if not deterministic_blockers:
                         verifier = _verify_variant(worker, story, candidate, band_key)
@@ -787,6 +893,9 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                         },
                     }
 
+                # A complete version that failed only on length, reading level
+                # or counts is revised on the next attempt, not written again.
+                revise_from: Optional[Dict[str, Any]] = None
                 for local_attempt in range(1, 4) if should_generate else []:
                     attempt = prior_attempts + local_attempt
                     if attempt > MAX_TOTAL_GENERATION_ATTEMPTS:
@@ -794,7 +903,9 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                     try:
                         payload = _call_structured(
                             worker,
-                            _build_prompt(story, band_key, prior_blockers),
+                            _build_revision_prompt(story, band_key, revise_from, prior_blockers)
+                            if revise_from is not None
+                            else _build_prompt(story, band_key, prior_blockers),
                             VARIANT_SCHEMA,
                             5200,
                         )
@@ -809,7 +920,7 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                             if safe_text(item.get("definition"))
                             and safe_text(item.get("term")).lower() in normalized_article
                         ]
-                        deterministic_blockers, metrics = _validate_variant(candidate, band_key, allowed_ids)
+                        deterministic_blockers, metrics = _validate_variant(candidate, band_key, allowed_ids, _story_disclosure(story))
                         candidate["readability"] = metrics
                         verifier = {"ok": False, "blockers": [], "notes": []}
                         if not deterministic_blockers:
@@ -841,8 +952,10 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
                         if next_variant["status"] == "ready":
                             break
                         prior_blockers = combined_blockers
+                        revise_from = candidate if _revisable(candidate, combined_blockers) else None
                     except Exception as exc:  # pragma: no cover - external service behavior
                         prior_blockers = [safe_text(exc)]
+                        revise_from = None
                         next_variant = {
                             "band_key": band_key,
                             "band_label": GRADE_BANDS[band_key]["label"],
