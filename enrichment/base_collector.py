@@ -13,10 +13,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
-from . import bypass as _bypass
+from .crawl_policy import ROBOTS, USER_AGENT, is_challenge_page
 
 logger = logging.getLogger(__name__)
 
@@ -93,17 +94,15 @@ class BaseCollector(ABC):
         rate_limit_delay: float = 1.0,
         timeout: float = 30.0,
         max_retries: int = 5,
-        bypass_tier: str = "direct",
     ):
         self.cache_dir = cache_dir
         self.rate_limit_delay = rate_limit_delay
         self.timeout = timeout
         self.max_retries = max_retries
-        # "direct" | "curl_cffi" | "playwright"
-        # Collectors targeting Cloudflare-walled sites set this to "curl_cffi"
-        # so escalation to playwright is automatic on block detection.
-        self.bypass_tier = bypass_tier
         self._last_request_time = 0.0
+        # True while the last API answer was a 429, so a collector can say
+        # "rate-limited" instead of "not found" when its retries run out.
+        self.rate_limited = False
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -123,9 +122,7 @@ class BaseCollector(ABC):
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout),
                 follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; AcademicProfileBot/1.0; research-project)"
-                },
+                headers={"User-Agent": USER_AGENT},
             )
         return self._client
 
@@ -152,45 +149,13 @@ class BaseCollector(ABC):
         headers: Optional[Dict] = None,
     ) -> Optional[str]:
         """
-        Fetch raw HTML/text with automatic Cloudflare bypass when available.
-        Collectors scraping anti-bot-walled sites should use this instead of
-        raw httpx.
-
-        Ladder:
-          1. If bypass_tier == "direct" → httpx; on 403/block, try curl_cffi.
-          2. If bypass_tier == "curl_cffi" → start with curl_cffi, escalate.
-          3. If bypass_tier == "playwright" → go straight to playwright.
+        Fetch a web page's text, as crawl_policy says pages are fetched:
+        under our own name, only where robots.txt allows, and a 401/403/429
+        or a bot-check page is the site's answer - None, not a retry in
+        disguise. For documented APIs use _get_json / _get_api_text.
         """
-        await self._rate_limit()
-
-        # Tier 1: httpx direct (always try first unless explicitly skipped)
-        if self.bypass_tier == "direct":
-            try:
-                client = await self.get_client()
-                resp = await client.get(url, params=params, headers=headers)
-                if resp.status_code == 200 and not _bypass.is_blocked_html(resp.text):
-                    return resp.text
-                if resp.status_code in (401, 404, 410):
-                    return None
-                # Block detected — fall through to bypass ladder
-            except Exception as e:
-                logger.debug("[%s] direct fetch failed: %s; trying bypass", self.source_name, e)
-
-        # Tier 2/3: bypass ladder
-        start = "curl_cffi" if self.bypass_tier in ("direct", "curl_cffi") else "playwright"
-        resp = await _bypass.fetch_with_ladder(
-            url,
-            params=params,
-            headers=headers,
-            timeout=self.timeout,
-            start_tier=start,
-        )
-        if resp is None:
-            return None
-        print(f"    [{self.source_name}] 🛡️  Bypass tier '{resp.tier}' used for {url}")
-        if resp.status >= 400 or _bypass.is_blocked_html(resp.text):
-            return None
-        return resp.text
+        page = await self._fetch_page(url, params=params, headers=headers, accept_pdf=False)
+        return page["text"] if page else None
 
     async def _fetch_any(
         self,
@@ -200,77 +165,69 @@ class BaseCollector(ABC):
         accept_pdf: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """
-        Fetch a URL and return both text and binary content, transparently
-        escalating through the Cloudflare bypass ladder when the direct
-        request 403s or returns a Cloudflare challenge page.
+        Fetch a web page or PDF under crawl_policy's rules.
 
-        Returns a dict {status, content_type, text, content, url, tier} or
-        None on total failure.
-
-        Use this for collectors that scrape generic web pages (can be HTML
-        or PDF) — e.g. web_search_collector's seed fetch, osu_expertise's
-        Knowledge Bank scrape.
+        Returns {status, content_type, text, content, url} or None when
+        robots.txt disallows the page, the site refuses us, or it fails.
         """
+        return await self._fetch_page(url, headers=headers, accept_pdf=accept_pdf)
+
+    async def _fetch_page(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        accept_pdf: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        full_url = str(httpx.URL(url, params=params)) if params else url
+        if not await ROBOTS.allows(full_url):
+            print(f"    [{self.source_name}] robots.txt disallows {full_url} - skipped")
+            return None
         await self._rate_limit()
-
-        # Tier 1: httpx direct (attempt first for cheap pages)
-        if self.bypass_tier in ("direct", "curl_cffi"):
-            try:
-                client = await self.get_client()
-                resp = await client.get(url, headers=headers)
-                ct = (resp.headers.get("content-type") or "").lower()
-                # PDF path — binary; no block-check needed
-                if accept_pdf and ("application/pdf" in ct or url.lower().endswith(".pdf")):
-                    if resp.status_code == 200 and resp.content:
-                        return {
-                            "status": resp.status_code,
-                            "content_type": "pdf",
-                            "text": "",
-                            "content": resp.content,
-                            "url": str(resp.url),
-                            "tier": "direct",
-                        }
-                # HTML / text path — check for block
-                if resp.status_code == 200 and not _bypass.is_blocked_html(resp.text):
-                    return {
-                        "status": resp.status_code,
-                        "content_type": "html" if "text/html" in ct or "text/plain" in ct else ct,
-                        "text": resp.text,
-                        "content": resp.content,
-                        "url": str(resp.url),
-                        "tier": "direct",
-                    }
-                if resp.status_code in (401, 404, 410):
-                    return None
-                # 403 / cf-challenge signature → escalate
-            except Exception as e:
-                logger.debug("[%s] direct fetch failed: %s; escalating", self.source_name, e)
-
-        # Tier 2/3: bypass ladder (curl_cffi → playwright). These only return
-        # text (HTML) — can't get raw binary through Playwright cheaply — so
-        # for PDFs we're limited to Tier 1.
-        if url.lower().endswith(".pdf"):
+        delay = await ROBOTS.crawl_delay(full_url)
+        if delay and delay > self.rate_limit_delay:
+            await asyncio.sleep(delay - self.rate_limit_delay)
+        # Our name is the only one we send, whatever a caller passes.
+        headers = {k: v for k, v in (headers or {}).items() if k.lower() != "user-agent"}
+        try:
+            client = await self.get_client()
+            resp = await client.get(full_url, headers=headers)
+        except Exception as e:
+            logger.debug("[%s] fetch failed for %s: %s", self.source_name, full_url, e)
             return None
-        start = "curl_cffi" if self.bypass_tier in ("direct", "curl_cffi") else "playwright"
-        resp2 = await _bypass.fetch_with_ladder(
-            url,
-            headers=headers,
-            timeout=self.timeout,
-            start_tier=start,
-        )
-        if resp2 is None:
+        if resp.status_code in (401, 403, 429):
+            print(f"    [{self.source_name}] {urlsplit(full_url).netloc} refused the bot ({resp.status_code}) - skipped")
             return None
-        if resp2.status >= 400 or _bypass.is_blocked_html(resp2.text):
+        if resp.status_code != 200:
             return None
-        print(f"    [{self.source_name}] 🛡️  Bypass tier '{resp2.tier}' used for {url}")
+        ct = (resp.headers.get("content-type") or "").lower()
+        if accept_pdf and ("application/pdf" in ct or full_url.lower().endswith(".pdf")):
+            if not resp.content:
+                return None
+            return {"status": 200, "content_type": "pdf", "text": "", "content": resp.content, "url": str(resp.url)}
+        if is_challenge_page(resp.text):
+            print(f"    [{self.source_name}] {urlsplit(full_url).netloc} answered with a bot check - skipped")
+            return None
         return {
-            "status": resp2.status,
-            "content_type": "html",
-            "text": resp2.text,
-            "content": resp2.text.encode("utf-8", errors="ignore"),
-            "url": resp2.url,
-            "tier": resp2.tier,
+            "status": 200,
+            "content_type": "html" if "text/html" in ct or "text/plain" in ct else ct,
+            "text": resp.text,
+            "content": resp.content,
+            "url": str(resp.url),
         }
+
+    async def _get_api_text(self, url: str, params: Optional[Dict] = None) -> Optional[str]:
+        """GET a documented API that answers in text or XML (e.g. arXiv's Atom
+        API). Governed by that API's terms, not robots.txt."""
+        await self._rate_limit()
+        try:
+            client = await self.get_client()
+            resp = await client.get(url, params=params)
+        except Exception as e:
+            logger.debug("[%s] API request failed: %s", self.source_name, e)
+            return None
+        return resp.text if resp.status_code == 200 else None
 
     async def _get_json(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """GET request returning parsed JSON, with retry + rate limit + jitter."""
@@ -280,6 +237,7 @@ class BaseCollector(ABC):
                 client = await self.get_client()
                 resp = await client.get(url, params=params)
                 if resp.status_code == 429:
+                    self.rate_limited = True
                     # Exponential backoff: 5s, 15s, 35s, 75s, 120s + jitter
                     wait = min(5 * (2 ** attempt) + random.uniform(0, 5), 120)
                     print(f"    [{self.source_name}] ⏳ Rate limited (429), retrying in {wait:.0f}s (attempt {attempt}/{self.max_retries})...")
@@ -289,6 +247,7 @@ class BaseCollector(ABC):
                 if resp.status_code in (400, 401, 403, 404, 405, 410, 422):
                     return None
                 resp.raise_for_status()
+                self.rate_limited = False
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
@@ -316,6 +275,7 @@ class BaseCollector(ABC):
                 client = await self.get_client()
                 resp = await client.post(url, json=json_body, params=params)
                 if resp.status_code == 429:
+                    self.rate_limited = True
                     wait = min(5 * (2 ** attempt) + random.uniform(0, 5), 120)
                     print(f"    [{self.source_name}] ⏳ Rate limited (429), retrying in {wait:.0f}s (attempt {attempt}/{self.max_retries})...")
                     await asyncio.sleep(wait)
@@ -323,6 +283,7 @@ class BaseCollector(ABC):
                 if resp.status_code in (400, 401, 403, 404, 405, 410, 422):
                     return None
                 resp.raise_for_status()
+                self.rate_limited = False
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code

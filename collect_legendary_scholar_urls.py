@@ -1,6 +1,6 @@
 """
-Collect URLs about each legendary scholar via DuckDuckGo and write one
-URL-list .txt file per scholar.
+Collect URLs about each legendary scholar via Wikipedia's API and the Brave
+Search API, and write one URL-list .txt file per scholar.
 
 Input:
   - excel/legendary.xlsx
@@ -11,30 +11,34 @@ Output:
 The workbook is treated as the canonical scholar list. This script only
 collects URL lists; downstream scraping/chunking/storage is handled by
 run_legendary_enrichment.py.
+
+Search engines' terms forbid scraping their results pages; Brave's API
+(BRAVE_SEARCH_API) is the permitted route, and without a key only the
+Wikipedia seeds are collected.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
 from dotenv import load_dotenv
 
 from collect_osu_scholar_urls import _append_log
-from collect_osu_scholar_urls import _ddg_search
+from collect_osu_scholar_urls import brave_search
 from collect_osu_scholar_urls import _domain_of
 from collect_osu_scholar_urls import _normalize_url
 from collect_osu_scholar_urls import _save_checkpoint
 from collect_osu_scholar_urls import _should_skip
+from enrichment.crawl_policy import USER_AGENT
 
 
 DEFAULT_EXCEL_PATH = "excel/legendary.xlsx"
@@ -321,9 +325,9 @@ def _filter_wikipedia_extlinks(urls: List[str]) -> List[str]:
 
 
 def _wikipedia_seed_sync(scholar: ScholarRow) -> List[str]:
-    email = os.getenv("OPENALEX_EMAIL") or "research@example.com"
+    # Wikimedia's API policy asks for a User-Agent with a real contact; ours has one.
     headers = {
-        "User-Agent": f"legendary-scholar-enrichment/1.0 (research; {email})",
+        "User-Agent": USER_AGENT,
         "Accept": "application/json",
     }
     search_terms = [
@@ -420,55 +424,9 @@ async def _seed_urls_for_scholar(scholar: ScholarRow) -> List[str]:
     return ordered
 
 
-def _parse_ddg_html(html: str) -> List[Dict[str, str]]:
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return []
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception:
-        return []
-    out: List[Dict[str, str]] = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href") or ""
-        if "/l/?" in href:
-            qs = parse_qs(urlparse(href).query)
-            real = qs.get("uddg") or qs.get("u")
-            if real:
-                href = unquote(real[0])
-        if href.startswith("http"):
-            out.append({"url": href, "title": a.get_text(strip=True), "snippet": ""})
-    return out
-
-
-def _ddg_html_search_sync(query: str, max_results: int) -> List[Dict[str, str]]:
-    url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query})
-    req = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    try:
-        with urlopen(req, timeout=25) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return []
-    return _parse_ddg_html(html)[:max_results]
-
-
 async def _search_query(query: str, max_results: int) -> List[Dict[str, str]]:
-    results = await _ddg_search(query, max_results)
-    if results:
-        return results
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: _ddg_html_search_sync(query, max_results))
+    # Search engines' terms forbid automated results scraping; Brave's API is the permitted route.
+    return await brave_search(query, max_results)
 
 
 def _load_scholars(excel_path: Path) -> List[ScholarRow]:
@@ -790,7 +748,7 @@ async def main_async(args: argparse.Namespace) -> int:
             "profile_url": urls[0] if urls else "",
             "field": scholar.field,
             "row_number": scholar.row_number,
-            "collector_version": "ddg_v2_legendary_precision",
+            "collector_version": "brave_v1_legendary_precision",
         }
         meta_file.write_text(json.dumps(meta_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 

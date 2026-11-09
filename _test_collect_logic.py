@@ -90,7 +90,7 @@ skip_cases = [
     ('https://www.facebook.com/profile', True),
     ('https://help.pbs.org/support/12345', True),
     ('https://www.osu.edu/faculty/yedavalli', False),
-    ('https://scholar.google.com/citations?user=xx', False),
+    ('https://scholar.google.com/citations?user=xx', True),  # its terms forbid automated access
     ('https://orcid.org/0000-0001-2345-6789', False),
 ]
 for url, expected_skip in skip_cases:

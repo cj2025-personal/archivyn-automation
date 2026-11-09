@@ -7,6 +7,8 @@ import re
 import requests
 from typing import Optional, Tuple
 
+from enrichment.crawl_policy import USER_AGENT, robots_allows
+
 
 def get_domain(url: str) -> str:
     """Extract domain from URL"""
@@ -252,8 +254,13 @@ def _check_content_type_header(url: str) -> Optional[Tuple[bool, str]]:
         # Disable SSL verification for self-signed certificates
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        # Probing someone else's page is a fetch too: our own name, only where robots.txt allows.
+        if not robots_allows(url):
+            return None
         # Make HEAD request (lightweight, no body download)
-        response = requests.head(url, timeout=10, allow_redirects=True, verify=False)
+        response = requests.head(url, timeout=10, allow_redirects=False, verify=False, headers={'User-Agent': USER_AGENT})
+        if response.is_redirect:
+            return None  # not followed: its target has not been checked against robots.txt
         content_type = response.headers.get('content-type', '').lower()
         
         if not content_type:
@@ -292,8 +299,15 @@ def _check_file_magic_numbers(url: str) -> Optional[bool]:
         # Disable SSL verification for self-signed certificates
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        if not robots_allows(url):
+            return None
         # Download only first 512 bytes (enough for magic number detection)
-        response = requests.get(url, timeout=10, stream=True, headers={'Range': 'bytes=0-511'}, verify=False)
+        response = requests.get(
+            url, timeout=10, stream=True, allow_redirects=False, verify=False,
+            headers={'Range': 'bytes=0-511', 'User-Agent': USER_AGENT},
+        )
+        if response.is_redirect:
+            return None  # not followed: its target has not been checked against robots.txt
         response.raise_for_status()
         
         # Read first bytes

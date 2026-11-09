@@ -25,3 +25,6 @@ google-cloud-aiplatform>=1.70.0
 # extracts its main text.
 requests>=2.32.2
 beautifulsoup4==4.12.2
+# daily_story_worker reads robots.txt and its User-Agent from
+# enrichment/crawl_policy.py, which imports httpx.
+httpx>=0.27.1

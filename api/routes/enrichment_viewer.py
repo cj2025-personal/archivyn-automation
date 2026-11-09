@@ -242,18 +242,16 @@ body {
 let allProfessors = [];
 const ALL_SOURCES = [
     'orcid', 'osu_expertise', 'semantic_scholar', 'openalex', 'crossref',
-    'google_scholar', 'nsf_grants', 'nih_grants', 'osu_courses',
-    'rate_my_professor', 'osu_news', 'google_news', 'youtube_lectures'
+    'nsf_grants', 'nih_grants', 'osu_courses',
+    'osu_news', 'google_news', 'youtube_lectures'
 ];
 const SOURCE_LABELS = {
     'semantic_scholar': 'Semantic Scholar',
     'openalex': 'OpenAlex',
-    'google_scholar': 'Google Scholar',
     'crossref': 'CrossRef',
     'orcid': 'ORCID',
     'nsf_grants': 'NSF Grants',
     'nih_grants': 'NIH Grants',
-    'rate_my_professor': 'RateMyProfessors',
     'osu_courses': 'OSU Courses',
     'osu_news': 'OSU News',
     'google_news': 'Google News',

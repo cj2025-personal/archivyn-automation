@@ -2,23 +2,27 @@
 Web Search collector — the most accurate enrichment approach.
 
 Strategy:
-1. DuckDuckGo search: "professor name" + "Ohio State University" + department
+1. Brave Search API (an official search API - search engines' results pages
+   are not scraped): "professor name" + "Ohio State" + department
 2. Additional targeted searches for publications, research papers, grants
 3. Visit each result URL — scrape the MAIN CONTENT only (strip nav/sidebar/footer/ads)
 4. RECURSIVE HOPPING: extract outbound links from each page and follow ones that
    look like they belong to the professor (publications, CV, lab, project pages).
    Continues up to MAX_DEPTH hops from the original search results.
 5. Download and parse PDFs (research papers, CVs, publications)
-6. Detect and skip Cloudflare/captcha-protected pages gracefully
+6. A page robots.txt disallows, a 401/403/429, or a bot-check page is
+   skipped - the site's answer, not something to get past (crawl_policy).
 7. Validate every page mentions the correct professor
 
-Requires: pip install duckduckgo-search
+Requires BRAVE_SEARCH_API (the same key the admin app's photo search uses).
+Only result URLs are used from the search API; its snippets are not kept.
 PDF parsing uses PyMuPDF (already installed).
 """
 
 import asyncio
 import io
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse, urljoin
@@ -42,12 +46,13 @@ SKIP_DOMAINS = {
     # without login is minimal (usually just name + headline); not worth
     # the ToS exposure for the small signal. Skip entirely.
     "linkedin.com",
+    # Same reason: their terms forbid automated collection (Google Scholar's
+    # robots.txt disallows its profile pages too).
+    "researchgate.net", "academia.edu", "scholar.google.",
 }
 
 PRIORITY_DOMAINS = [
     "osu.edu",
-    "scholar.google.com",
-    "researchgate.net",
     "pubmed.ncbi.nlm.nih.gov",
     "ncbi.nlm.nih.gov",
     "arxiv.org",
@@ -144,10 +149,11 @@ STRIP_IDS = [
 
 # ── Limits ─────────────────────────────────────────────────────────────
 
-MAX_SEED_PAGES = 10        # max pages from DDG search results (depth 0)
+MAX_SEED_PAGES = 10        # max pages from search results (depth 0)
 MAX_TOTAL_PAGES = 25       # absolute max across all depths
 MAX_DEPTH = 2              # how many hops from seed pages
 MAX_HOP_LINKS = 8          # max links to follow from a single page
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 MAX_TEXT_PER_PAGE = 8000
 MAX_PDF_PAGES = 20
 MAX_PDF_TEXT = 15000
@@ -159,10 +165,6 @@ class WebSearchCollector(BaseCollector):
     def __init__(self, **kwargs):
         kwargs.setdefault("rate_limit_delay", 2.5)
         kwargs.setdefault("timeout", 25.0)
-        # Enable Cloudflare-bypass ladder so that when a scraped page returns a
-        # cf-challenge body, we escalate to curl_cffi / playwright before
-        # giving up (previous behaviour just returned None).
-        kwargs.setdefault("bypass_tier", "curl_cffi")
         super().__init__(**kwargs)
 
     @property
@@ -170,11 +172,14 @@ class WebSearchCollector(BaseCollector):
         return "web_search"
 
     async def collect(self, query: ProfessorQuery) -> CollectorResult:
-        # Step 1: DDG search → seed URLs
-        seed_urls = await self._search_ddg(query)
+        # Step 1: search API → seed URLs
+        if not os.getenv("BRAVE_SEARCH_API", "").strip():
+            return self._make_result(query, success=False,
+                                     error="No BRAVE_SEARCH_API key; web search skipped")
+        seed_urls = await self._search(query)
         if not seed_urls:
             return self._make_result(query, success=False,
-                                     error="No search results from DuckDuckGo")
+                                     error="No search results")
         print(f"    [web_search] Found {len(seed_urls)} seed URLs")
 
         # Step 2: Recursive scrape — seeds are depth 0, follow links up to MAX_DEPTH
@@ -245,128 +250,56 @@ class WebSearchCollector(BaseCollector):
 
     # ── Search ─────────────────────────────────────────────────────────
 
-    async def _search_ddg(self, query: ProfessorQuery) -> List[Dict]:
-        """Multi-query DuckDuckGo search covering profile, publications, grants.
-
-        Two-tier: first the duckduckgo-search library (fast when it works),
-        then a raw HTML fallback that routes through our curl_cffi bypass when
-        DDG rate-limits the library's IP.
-        """
+    async def _search(self, query: ProfessorQuery) -> List[Dict]:
+        """Seed URLs from the Brave Search API: profile, publications, department."""
         base = f'"{query.name}" "Ohio State"'
-        search_queries = [
-            base,
-            f'{base} publications research',
-            f'{base} Google Scholar',
-        ]
+        search_queries = [base, f'{base} publications research']
         if query.department:
             search_queries.append(f'{base} {query.department}')
 
+        key = os.getenv("BRAVE_SEARCH_API", "").strip()
+        client = await self.get_client()
         all_results: List[Dict] = []
         seen_urls: Set[str] = set()
-
-        # ── Tier 1: duckduckgo-search library ─────────────────────────────
-        try:
-            from duckduckgo_search import DDGS
-            ddgs_available = True
-        except ImportError:
-            ddgs_available = False
-            print("    [web_search] ⚠️ duckduckgo-search not installed; using HTML fallback only")
-
-        if ddgs_available:
-            for sq in search_queries:
-                try:
-                    results = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda q=sq: list(DDGS().text(q, max_results=12))
-                    )
-                    for r in results:
-                        url = r.get("href", "")
-                        if url and url not in seen_urls and not self._should_skip(url):
-                            seen_urls.add(url)
-                            all_results.append({
-                                "url": url,
-                                "title": r.get("title", ""),
-                                "snippet": r.get("body", ""),
-                            })
-                except Exception as e:
-                    logger.debug("[web_search] DDGS lib failed on '%s': %s", sq[:60], e)
-
-                await asyncio.sleep(2.0)
-
-        # ── Tier 2: HTML fallback through bypass ladder ───────────────────
-        # If the library returned 0 results, try raw HTML queries — curl_cffi
-        # often succeeds where the library's HTTPX calls get rate-limited.
-        if not all_results:
-            print("    [web_search] DDGS lib returned 0 results — trying HTML fallback via bypass")
-            for sq in search_queries[:2]:  # fewer queries on fallback to save time
-                html = await self._fetch_html(
-                    "https://html.duckduckgo.com/html/",
-                    params={"q": sq},
+        for sq in search_queries:
+            await self._rate_limit()
+            try:
+                resp = await client.get(
+                    BRAVE_ENDPOINT,
+                    params={"q": sq, "count": 12},
+                    headers={"X-Subscription-Token": key, "Accept": "application/json"},
                 )
-                if not html:
-                    continue
-                parsed = self._parse_ddg_html(html)
-                for r in parsed:
-                    url = r["url"]
-                    if url and url not in seen_urls and not self._should_skip(url):
-                        seen_urls.add(url)
-                        all_results.append(r)
-                await asyncio.sleep(2.0)
+            except Exception as e:
+                logger.debug("[web_search] search failed on '%s': %s", sq[:60], e)
+                continue
+            if resp.status_code != 200:
+                print(f"    [web_search] search API answered {resp.status_code} for '{sq[:60]}'")
+                continue
+            for r in ((resp.json() or {}).get("web") or {}).get("results") or []:
+                url = r.get("url", "")
+                if url and url not in seen_urls and not self._should_skip(url):
+                    seen_urls.add(url)
+                    all_results.append({"url": url, "title": r.get("title", ""), "snippet": ""})
 
         all_results.sort(key=lambda r: self._url_priority(r["url"]))
         return all_results[:MAX_SEED_PAGES + 8]
-
-    def _parse_ddg_html(self, html: str) -> List[Dict]:
-        """Extract result URLs from DuckDuckGo's HTML search page."""
-        try:
-            from bs4 import BeautifulSoup
-        except ImportError:
-            return []
-        from urllib.parse import unquote, parse_qs, urlparse
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception:
-            return []
-        out: List[Dict] = []
-        for a in soup.select("a.result__a"):
-            href = a.get("href") or ""
-            # DDG wraps URLs in /l/?uddg=<encoded>
-            if "/l/?" in href:
-                qs = parse_qs(urlparse(href).query)
-                real = qs.get("uddg") or qs.get("u")
-                if real:
-                    href = unquote(real[0])
-            if href.startswith("http"):
-                out.append({"url": href, "title": a.get_text(strip=True), "snippet": ""})
-        return out
 
     # ── Fetch + extract (returns page dict AND raw html for link extraction) ──
 
     async def _fetch_and_extract(
         self, url: str, url_info: Dict, query: ProfessorQuery
     ) -> tuple:
-        """Fetch a URL (with Cloudflare bypass escalation), extract text.
+        """Fetch a URL under crawl_policy's rules and extract its text.
 
         Returns (page_dict_or_None, raw_html_or_None).
         """
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;"
                 "q=0.9,application/pdf;q=0.8,*/*;q=0.7"
             ),
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "DNT": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
         }
-
-        # Route through bypass-aware fetcher — auto-escalates on 403 / cf-challenge
         result = await self._fetch_any(url, headers=headers, accept_pdf=True)
         if not result:
             return None, None

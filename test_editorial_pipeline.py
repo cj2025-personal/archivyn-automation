@@ -448,7 +448,16 @@ def _story_worker(stories=(), scholars=(), db=None, **env):
             mock.patch.object(worker_module, "resolve_mongo_db_name", return_value="test"):
         worker = worker_module.DailyStoryWorker(use_llm=False, trends_enabled=True)
     worker.article_http = FakeHttp()  # never the network
+    worker.article_robots = _robots()  # nor for robots.txt
     return worker
+
+
+def _robots(robots_txt=None):
+    """A robots.txt policy answered without the network: no robots.txt at all
+    (every page allowed) unless robots_txt is given."""
+    from enrichment.crawl_policy import SyncRobotsPolicy
+
+    return SyncRobotsPolicy(fetch=lambda url: (404, "") if robots_txt is None else (200, robots_txt))
 
 
 class FakeResponse:
@@ -867,7 +876,9 @@ class ArticleTextTests(unittest.TestCase):
         self.assertNotIn("fallback", issue["article_fetch"])
         self.assertEqual(issue["title"], KENYA["title"], "the feed item is otherwise unchanged")
         [(url, kwargs)] = worker.article_http.requests
-        self.assertIn("ArchivynStoryReader", kwargs["headers"]["User-Agent"])
+        from enrichment.crawl_policy import USER_AGENT
+
+        self.assertEqual(kwargs["headers"]["User-Agent"], USER_AGENT)
         self.assertEqual(kwargs["timeout"], (5, 10))
         self.assertEqual((kwargs["allow_redirects"], kwargs["stream"]), (False, True))
 
@@ -938,6 +949,33 @@ class ArticleTextTests(unittest.TestCase):
             self.assertEqual(worker.article_http.requests, [], url)
         worker, issue = self._fetch({self.URL: FakeResponse(302, headers={"Location": "http://127.0.0.1/admin"})})
         self.assertEqual((issue["article_fetch"]["status"], len(worker.article_http.requests)), ("refused_host", 1))
+
+    def test_a_page_robots_txt_disallows_is_never_requested_not_even_by_a_redirect(self) -> None:
+        from urllib.parse import urlparse
+
+        host = urlparse(self.URL)
+        robots = f"User-agent: ProjArchBot\nDisallow: {host.path}\n"
+        worker = _story_worker()
+        worker.article_robots = _robots(robots)
+        worker.article_http = FakeHttp({self.URL: FakeResponse(body=_article_page())})
+        issue = worker._with_article_text(KENYA)
+        self.assertEqual(worker.article_http.requests, [], "no request is made")
+        self.assertEqual((issue["article_text"], issue["article_fetch"]["status"]), ("", "robots_disallowed"))
+        self.assertEqual(issue["article_fetch"]["fallback"], "title_and_summary")
+
+        moved = f"{host.scheme}://{host.netloc}/elsewhere"
+        worker.article_robots = _robots("User-agent: *\nDisallow: /elsewhere\n")
+        worker.article_http = FakeHttp({
+            self.URL: FakeResponse(301, headers={"Location": moved}),
+            moved: FakeResponse(body=_article_page()),
+        })
+        issue = worker._with_article_text(KENYA)
+        self.assertEqual([url for url, _ in worker.article_http.requests], [self.URL])
+        self.assertEqual(issue["article_fetch"]["status"], "robots_disallowed")
+
+    def test_a_bot_check_page_is_a_refusal_not_article_text(self) -> None:
+        _, issue = self._fetch({self.URL: FakeResponse(body=b"<html><title>Just a moment...</title>Checking your browser</html>")})
+        self.assertEqual((issue["article_text"], issue["article_fetch"]["status"]), ("", "bot_check"))
 
     def test_the_size_cap_stops_the_read_and_the_text_is_trimmed(self) -> None:
         import daily_story_worker as worker_module

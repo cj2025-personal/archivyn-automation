@@ -11,6 +11,11 @@ Design goals:
 - Stable profile IDs so MongoDB/Pinecone converge on one record per scholar
 - Per-workbook checkpoints so new rows are processed and unchanged rows are skipped
 - Strict URL identity checks to avoid contaminating the corpus with the wrong person
+- Lawful discovery: web search goes through the Brave Search API
+  (BRAVE_SEARCH_API; search engines' results pages are never scraped), no
+  query searches for a person by their email handle, and sites whose terms
+  forbid automated access (Google Scholar, ResearchGate, Academia.edu) are
+  never collected, since every collected URL is fetched
 
 Usage:
     python run_universities_folder_pipeline.py
@@ -39,7 +44,9 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from api.utils.source_guardrails import is_noise_domain
+from collect_osu_scholar_urls import brave_search
 from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
+from enrichment.crawl_policy import USER_AGENT
 from unified_pipeline import UnifiedPipeline
 
 
@@ -64,6 +71,10 @@ SKIP_DOMAINS = {
     "youtube.com",
     "amazon.com",
     "wikipedia.org",
+    # Their terms forbid automated access, and every collected URL is fetched.
+    "scholar.google.com",
+    "researchgate.net",
+    "academia.edu",
 }
 
 SKIP_EXACT_HOSTS = {
@@ -77,20 +88,16 @@ SKIP_EXACT_HOSTS = {
 
 IDENTITY_DOMAINS = {
     "orcid.org",
-    "scholar.google.com",
     "semanticscholar.org",
     "openalex.org",
-    "researchgate.net",
     "dblp.org",
     "loop.frontiersin.org",
 }
 
 IDENTITY_PROFILE_URL_RULES: Dict[str, Tuple[str, ...]] = {
     "orcid.org": ("/0000-",),
-    "scholar.google.com": ("/citations", "citations?user="),
     "semanticscholar.org": ("/author/",),
     "openalex.org": ("/authors/",),
-    "researchgate.net": ("/profile/",),
     "dblp.org": ("/pid/", "/pers/hd/"),
     "loop.frontiersin.org": ("/people/", "/researcher/"),
 }
@@ -356,10 +363,6 @@ def url_priority(url: str, identity: Dict[str, str]) -> int:
         return 4
     if host == "orcid.org" or host.endswith(".orcid.org"):
         return 5
-    if host == "scholar.google.com" or host.endswith(".scholar.google.com"):
-        return 25
-    if host == "researchgate.net" or host.endswith(".researchgate.net"):
-        return 30
     if host == "semanticscholar.org" or host.endswith(".semanticscholar.org"):
         return 35
     if host == "openalex.org" or host.endswith(".openalex.org"):
@@ -704,8 +707,6 @@ def build_queries(identity: Dict[str, str], aggressive: bool = False) -> List[st
     university_phrase = f'"{university}"' if university else ""
     source_host = identity.get("source_host", "").strip()
     official_host = identity.get("official_host", "").strip()
-    source_path_token = identity.get("source_path_token", "").strip()
-    email_local = identity.get("email_local", "").strip()
     keywords = identity.get("keywords", "").strip()
     expertise = identity.get("expertise", "").strip()
 
@@ -733,32 +734,20 @@ def build_queries(identity: Dict[str, str], aggressive: bool = False) -> List[st
         queries.append(f"{base} site:{source_host}")
     if official_host and official_host != source_host:
         queries.append(f"{base} site:{official_host}")
-    if source_path_token:
-        token_query = f'"{source_path_token}"'
-        queries.append(f"{token_query} {base}")
-        if source_host:
-            queries.append(f"{token_query} site:{source_host}")
-        if official_host and official_host != source_host:
-            queries.append(f"{token_query} site:{official_host}")
-        if university_phrase:
-            queries.append(f"{token_query} {university_phrase}")
-        queries.append(f"{token_query} filetype:pdf")
-    if email_local:
-        queries.append(f'"{email_local}" {base}')
-        if university_phrase:
-            queries.append(f'"{email_local}" {base} {university_phrase}')
+    # No query searches the web for a person by their email handle - nor by the
+    # last segment of their profile URL, which on many sites (OSU's name.123)
+    # is that handle. The segment still helps recognise their own pages below.
     if keywords:
         queries.append(f"{base} {keywords[:80]}")
     if expertise:
         queries.append(f"{base} {expertise[:80]}")
 
+    # Google Scholar and ResearchGate are not searched for: their pages are never fetched.
     queries.extend(
         [
             f"{base} site:orcid.org",
-            f"{base} site:scholar.google.com",
             f"{base} site:semanticscholar.org",
             f"{base} site:openalex.org",
-            f"{base} site:researchgate.net",
             f"{base} site:dblp.org",
             f"{base} filetype:pdf",
             f"{base} cv filetype:pdf",
@@ -777,7 +766,6 @@ def build_queries(identity: Dict[str, str], aggressive: bool = False) -> List[st
             extra.extend(
                 [
                     f"{base} {university_phrase} department directory",
-                    f"{base} {university_phrase} google scholar",
                     f"{base} {university_phrase} orcid",
                 ]
             )
@@ -791,7 +779,6 @@ def build_queries(identity: Dict[str, str], aggressive: bool = False) -> List[st
             queries.append(f"{alt_base} {university_phrase}")
             queries.append(f"{alt_base} {university_phrase} faculty profile")
         queries.append(f"{alt_base} site:orcid.org")
-        queries.append(f"{alt_base} site:scholar.google.com")
 
     seen = set()
     deduped: List[str] = []
@@ -1035,35 +1022,10 @@ def identity_match(result: Dict[str, str], identity: Dict[str, str]) -> bool:
     return False
 
 
-async def ddg_search(query: str, max_results: int) -> List[Dict[str, str]]:
-    try:
-        from ddgs import DDGS  # type: ignore
-    except ImportError:
-        try:
-            from duckduckgo_search import DDGS  # type: ignore
-        except ImportError:
-            raise RuntimeError("Install DDG search support with: pip install ddgs")
-
-    loop = asyncio.get_event_loop()
-    try:
-        results = await loop.run_in_executor(None, lambda: list(DDGS().text(query, max_results=max_results)))
-    except Exception as exc:
-        log_event("DDG", f"query failed: {query!r} :: {exc}", indent=2)
-        return []
-
-    output: List[Dict[str, str]] = []
-    for item in results:
-        url = item.get("href") or item.get("url") or ""
-        if not url:
-            continue
-        output.append(
-            {
-                "url": url,
-                "title": item.get("title", "") or "",
-                "snippet": item.get("body", "") or "",
-            }
-        )
-    return output
+async def web_search(query: str, max_results: int) -> List[Dict[str, str]]:
+    # Search engines' terms forbid automated results scraping; Brave's API is the
+    # permitted route. No BRAVE_SEARCH_API key, or a failure, gives no results.
+    return await brave_search(query, max_results)
 
 
 async def collect_urls_for_record(
@@ -1156,7 +1118,7 @@ async def collect_urls_for_record(
 
     for query_idx, query in enumerate(queries, start=1):
         log_event("Search", f"{query_idx}/{len(queries)} :: {query}", indent=2)
-        results = await ddg_search(query, per_query_results)
+        results = await web_search(query, per_query_results)
         raw_results += len(results)
         accepted_this_query = 0
         duplicate_this_query = 0
@@ -1313,11 +1275,11 @@ class UniversitiesFolderRunner:
         self.image_client = None
         self.image_coll = None
         self.args = args
-        user_agent = os.getenv("SCRAPER_HTTP_USER_AGENT") or "NGOAutomationScholarIngest/1.0"
+        # One honest name for every request, with a contact (crawl_policy).
         self.http_client = RetryHttpJsonClient(
             timeout_seconds=float(args.http_timeout_seconds),
             max_retries=int(args.http_retries),
-            user_agent=user_agent,
+            user_agent=USER_AGENT,
         )
         image_uri = os.getenv("MONGO_ATLAS_URI", "").strip()
         if image_uri:
@@ -1697,7 +1659,10 @@ class UniversitiesFolderRunner:
         )
         log_event(
             "Universities",
-            f"Discovery stack | OpenAlex={'On' if self.openalex_resolver is not None else 'Off'} DDG=On",
+            (
+                f"Discovery stack | OpenAlex={'On' if self.openalex_resolver is not None else 'Off'} "
+                f"BraveSearchAPI={'On' if os.getenv('BRAVE_SEARCH_API', '').strip() else 'Off (no BRAVE_SEARCH_API key)'}"
+            ),
         )
         for workbook_idx, workbook_path in enumerate(workbooks, start=1):
             log_event("Universities", f"Workbook {workbook_idx}/{len(workbooks)} queued: {workbook_path.name}")
@@ -1924,7 +1889,7 @@ class UniversitiesFolderRunner:
                 urls = collected.get("kept_urls", [])
                 primary_url = clean_cell(record.get("Source URL")) or (urls[0] if urls else "")
 
-                collector_version = "universities_ddg_v1_aggressive" if self.args.aggressive else "universities_ddg_v1_precision"
+                collector_version = "universities_brave_v1_aggressive" if self.args.aggressive else "universities_brave_v1_precision"
                 collection_meta = {
                     "collector_version": collector_version,
                     "raw_results": int(collected.get("raw_results", 0)),
@@ -2261,8 +2226,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-scholars", type=int, default=None, help="Optional cap on scholar rows per workbook")
     parser.add_argument("--start-from", type=int, default=0, help="Skip the first N scholar rows in each workbook")
     parser.add_argument("--max-urls", type=int, default=DEFAULT_MAX_URLS, help=f"Maximum collected URLs per scholar (default: {DEFAULT_MAX_URLS})")
-    parser.add_argument("--per-query-results", type=int, default=DEFAULT_PER_QUERY_RESULTS, help=f"DuckDuckGo results per query (default: {DEFAULT_PER_QUERY_RESULTS})")
-    parser.add_argument("--sleep-seconds", type=float, default=DEFAULT_SLEEP_SECONDS, help=f"Sleep between DDG queries (default: {DEFAULT_SLEEP_SECONDS})")
+    parser.add_argument("--per-query-results", type=int, default=DEFAULT_PER_QUERY_RESULTS, help=f"Search API results per query, at most 20 (default: {DEFAULT_PER_QUERY_RESULTS})")
+    parser.add_argument("--sleep-seconds", type=float, default=DEFAULT_SLEEP_SECONDS, help=f"Sleep between search API queries (default: {DEFAULT_SLEEP_SECONDS})")
     parser.add_argument("--http-timeout-seconds", type=float, default=DEFAULT_HTTP_TIMEOUT_SECONDS, help=f"HTTP timeout for API discovery calls (default: {DEFAULT_HTTP_TIMEOUT_SECONDS})")
     parser.add_argument("--http-retries", type=int, default=DEFAULT_HTTP_RETRIES, help=f"HTTP retries for API discovery calls (default: {DEFAULT_HTTP_RETRIES})")
     parser.add_argument(

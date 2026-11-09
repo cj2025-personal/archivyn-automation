@@ -19,13 +19,13 @@ logger = logging.getLogger(__name__)
 
 # Source-type groupings for prompt specialization
 PUBLICATION_SOURCES = {
-    "semantic_scholar", "openalex", "crossref", "google_scholar",
+    "semantic_scholar", "openalex", "crossref",
 }
 GRANT_SOURCES = {"nsf_grants", "nih_grants"}
 NEWS_SOURCES = {"osu_news", "google_news"}
 WEB_SOURCES = {"web_search"}
 PROFILE_SOURCES = {"orcid", "osu_expertise"}
-TEACHING_SOURCES = {"osu_courses", "rate_my_professor"}
+TEACHING_SOURCES = {"osu_courses"}
 MEDIA_SOURCES = {"youtube_lectures"}
 
 

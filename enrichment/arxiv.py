@@ -38,7 +38,7 @@ class ArxivCollector(BaseCollector):
             "sortOrder": "descending",
         }
 
-        text = await self._fetch_html(BASE_URL, params=params)
+        text = await self._get_api_text(BASE_URL, params=params)
         if not text:
             return self._make_result(query, success=False, error="arXiv query returned empty")
 

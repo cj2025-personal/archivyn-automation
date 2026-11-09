@@ -43,7 +43,7 @@ from api.utils.source_guardrails import (
     infer_license_for_url,
     is_noise_domain,
 )
-from api.utils.robots_checker import RobotsCache
+from enrichment.crawl_policy import USER_AGENT, robots_allows
 from api.utils.claim_extractor import extract_claims
 from profile_chunking_pipeline import ProfileChunkingPipeline
 
@@ -166,7 +166,6 @@ class UnifiedPipeline:
             (self.output_dir / "source_registry.jsonl")
         )
         self.source_registry = SourceRegistry(self.source_registry_path)
-        self.robots_cache = RobotsCache(user_agent=os.getenv("SCRAPER_USER_AGENT", "*"))
         self.default_search_meta = default_search_meta or {}
         # content-hash -> source_id index (for dedup)
         self._content_hash_index: Dict[str, str] = {}
@@ -1567,7 +1566,8 @@ class UnifiedPipeline:
         allowed_use = license_info.get("allowed_use", "facts_only")
         license_url = license_info.get("license_url", "")
         rights_holder = license_info.get("rights_holder", "")
-        robots_allowed = self.robots_cache.allowed(canonical) if canonical else None
+        # The same robots.txt reading, under the same name, as the fetch itself (crawl_policy).
+        robots_allowed = robots_allows(canonical) if canonical.startswith(("http://", "https://")) else None
         paywalled = self._detect_paywalled(content_text, fetch_meta)
         status, status_reason = self._decide_source_status(license_type, allowed_use, robots_allowed, paywalled)
         if self._is_anti_bot_content(content_text):
@@ -2660,11 +2660,17 @@ class UnifiedPipeline:
             import ssl
             import urllib.request
 
-            req = urllib.request.Request(cv_url, headers={"User-Agent": "Mozilla/5.0"})
+            # A CV is a page on someone else's site: fetched under our own name,
+            # and only where robots.txt allows it (crawl_policy).
+            if not robots_allows(cv_url):
+                return ""
+            req = urllib.request.Request(cv_url, headers={"User-Agent": USER_AGENT})
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with urllib.request.urlopen(req, context=ctx, timeout=45) as resp:
+                if not robots_allows(resp.geturl()):
+                    return ""  # redirected somewhere robots.txt disallows: not used
                 data = resp.read()
                 content_type = (resp.headers.get("Content-Type") or "").lower()
 

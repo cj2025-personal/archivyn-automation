@@ -22,10 +22,8 @@ from typing import Any, Dict, List, Optional, Set
 from .base_collector import BaseCollector, CollectorResult, ProfessorQuery
 from .semantic_scholar import SemanticScholarCollector
 from .openalex import OpenAlexCollector
-from .google_scholar import GoogleScholarCollector
 from .nsf_grants import NSFGrantsCollector
 from .nih_grants import NIHGrantsCollector
-from .rate_my_professor import RateMyProfessorCollector
 from .osu_courses import OSUCoursesCollector
 from .youtube_lectures import YouTubeLecturesCollector
 from .osu_news import OSUNewsCollector
@@ -41,7 +39,6 @@ from .arxiv import ArxivCollector
 from .wikidata import WikidataCollector
 from .wikipedia import WikipediaCollector
 from .github import GitHubCollector
-from .youtube_transcripts import YouTubeTranscriptsCollector
 from .usaspending import USASpendingCollector
 from .patentsview import PatentsViewCollector
 from .clinicaltrials import ClinicalTrialsCollector
@@ -66,7 +63,6 @@ ALL_COLLECTORS = {
     # -- Publication & citation data --
     "semantic_scholar": SemanticScholarCollector,
     "openalex": OpenAlexCollector,
-    "google_scholar": GoogleScholarCollector,
     "crossref": CrossRefCollector,
     "orcid": ORCIDCollector,
     "opencitations": OpenCitationsCollector,          # NEW
@@ -95,14 +91,12 @@ ALL_COLLECTORS = {
     "wikidata": WikidataCollector,                    # NEW
     "wikipedia": WikipediaCollector,                  # NEW
     # -- Teaching & student experience --
-    "rate_my_professor": RateMyProfessorCollector,
     "osu_courses": OSUCoursesCollector,
     # -- News & media --
     "osu_news": OSUNewsCollector,
     "google_news": GoogleNewsCollector,
     "gdelt": GDELTCollector,                          # NEW
     "youtube_lectures": YouTubeLecturesCollector,
-    "youtube_transcripts": YouTubeTranscriptsCollector,  # NEW
     # -- OSU-specific --
     "osu_expertise": OSUExpertiseCollector,
 }
@@ -116,13 +110,13 @@ API_KEY_REQUIREMENTS = {
 }
 
 # Collectors that depend on other collectors' output (run after base sweep).
-# Unpaywall/Altmetric/OpenCitations/YouTube-transcripts need DOIs or video IDs
-# produced by earlier collectors.
+# Unpaywall/Altmetric/OpenCitations need DOIs produced by earlier collectors;
+# Semantic Scholar identifies the scholar through the DOIs OpenAlex matched.
 DEPENDENT_SOURCES = {
+    "semantic_scholar": ["openalex"],
     "unpaywall": ["openalex", "crossref"],
     "altmetric": ["openalex", "crossref"],
     "opencitations": ["openalex", "crossref"],
-    "youtube_transcripts": ["youtube_lectures"],
 }
 
 # Priority order for text assembly (higher priority = listed first in output)
@@ -132,14 +126,12 @@ SOURCE_PRIORITY = [
     "wikidata",             # Structured facts (awards, positions, lineage)
     "orcid",                # Authoritative career data
     "osu_expertise",        # OSU-specific profiles
-    "youtube_transcripts",  # Differentiator: full lecture/talk transcripts
     "pmc_oa",               # Full-text biomedical papers
     "arxiv",                # Preprint full-text metadata
     "biorxiv",              # Life-sci preprints
     "semantic_scholar",
     "openalex",
     "crossref",
-    "google_scholar",
     "core_api",             # OA aggregator
     "unpaywall",            # Legal OA PDF links for existing DOIs
     "opencitations",        # Supplementary citation graph
@@ -156,7 +148,6 @@ SOURCE_PRIORITY = [
     "figshare",             # Datasets / figures / posters
     "osf",                  # Projects / pre-registrations
     "osu_courses",
-    "rate_my_professor",
     "osu_news",
     "google_news",
     "gdelt",                # Global news index
@@ -213,8 +204,8 @@ class EnrichmentOrchestrator:
         Run all enabled collectors for a single professor.
 
         Executes in two waves so that dependent collectors (unpaywall / altmetric
-        / opencitations / youtube_transcripts) can read DOIs / video IDs from
-        prior collectors via the enrichment.json file written after wave 1.
+        / opencitations / semantic_scholar) can read the DOIs earlier collectors
+        found, via the enrichment.json file written after wave 1.
 
         Returns dict of source_name -> CollectorResult.
         """
@@ -252,7 +243,7 @@ class EnrichmentOrchestrator:
 
         # Wave 2
         if wave2:
-            print(f"  [Enrich] Wave 2 — {len(wave2)} dependent sources (DOIs / video IDs)")
+            print(f"  [Enrich] Wave 2 — {len(wave2)} dependent sources (DOIs)")
             tasks = [_run(n, c) for n, c in wave2.items()]
             for item in await asyncio.gather(*tasks, return_exceptions=True):
                 if isinstance(item, Exception):
@@ -379,7 +370,7 @@ class EnrichmentOrchestrator:
     # Sources that apply to virtually all professors
     UNIVERSAL_SOURCES = {
         "web_search", "openalex", "osu_courses", "osu_news",
-        "osu_expertise", "crossref", "orcid", "rate_my_professor",
+        "osu_expertise", "crossref", "orcid",
         "wikidata", "gdelt",
     }
     # Domain-specific sources (only applicable if the professor is in STEM / biomed / CS)
@@ -390,9 +381,9 @@ class EnrichmentOrchestrator:
     # Data/artifact sources
     DATA_SOURCES = {"zenodo", "figshare", "osf"}
     # Media sources (hit-or-miss for any professor)
-    MEDIA_SOURCES = {"google_news", "youtube_lectures", "youtube_transcripts"}
+    MEDIA_SOURCES = {"google_news", "youtube_lectures"}
     # Dependent sources — scored only if the parent produced data
-    DEPENDENT_SOURCES_SET = {"unpaywall", "altmetric", "opencitations", "youtube_transcripts"}
+    DEPENDENT_SOURCES_SET = {"unpaywall", "altmetric", "opencitations", "semantic_scholar"}
 
     def _compute_confidence(
         self,
@@ -485,7 +476,7 @@ class EnrichmentOrchestrator:
 
         # Differentiator signal count (for richness_score)
         differentiator_hits = 0
-        for s in ("youtube_transcripts", "patentsview", "clinicaltrials",
+        for s in ("patentsview", "clinicaltrials",
                   "github", "huggingface", "wikidata", "altmetric",
                   "pmc_oa", "arxiv", "biorxiv", "zenodo", "usaspending"):
             if results.get(s) and results[s].success:

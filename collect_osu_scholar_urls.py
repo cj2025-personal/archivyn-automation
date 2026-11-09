@@ -1,12 +1,19 @@
 """
-Collect URLs about each OSU scholar via DuckDuckGo and write per-scholar
-.txt files that the existing legend pipeline can consume.
+Collect URLs about each OSU scholar via the Brave Search API and write
+per-scholar .txt files that the existing legend pipeline can consume.
 
 For each scholar in ``scholars`` where ``scholar_type == 'osu'`` we run a
-suite of identity-anchored DDG queries (full name + Ohio State + dept +
+suite of identity-anchored search queries (full name + Ohio State + dept +
 field), filter the results against a noise/skip blocklist, rank by
 domain authority, cap at ``--max-urls``, and write the result to
 ``osu_scholars/final/<slug>.txt``.
+
+Search engines' terms forbid scraping their results pages; Brave's API
+(BRAVE_SEARCH_API) is the permitted route, and without a key no search
+runs. Only each result's URL and title are used - the API's snippets are
+not kept. Sites whose terms forbid automated access (Google Scholar,
+ResearchGate, Academia.edu, LinkedIn) are never collected, because the
+downstream pipeline fetches every URL written here.
 
 The same URL list is also written back to the scholar's Mongo doc as
 the ``source`` array so the field is queryable even before the
@@ -14,10 +21,10 @@ downstream scrape pipeline runs.
 
 Identity safety:
 - Queries always quote the full name verbatim.
-- Each candidate URL is identity-validated against title + snippet:
+- Each candidate URL is identity-validated against its title and URL:
   the last name (or full name) must appear, and the result must mention
   Ohio State / OSU OR the scholar's department/field, OR live on a
-  high-authority academic domain (.edu / orcid / scholar.google / …).
+  high-authority academic domain (.edu / orcid / openalex / …).
   This is what prevents another "Kevin Brown" from a different
   institution from polluting the corpus.
 
@@ -53,12 +60,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+import httpx
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
 from api.utils.source_guardrails import is_noise_domain
+from enrichment.crawl_policy import USER_AGENT
 
 
 logging.basicConfig(
@@ -77,13 +86,14 @@ DEFAULT_PER_QUERY = 15
 
 # Domains to skip outright (mirrors legend pipeline blocklist + ToS-risky hosts).
 # Note: ``google.com`` is intentionally NOT here — we want to keep
-# ``scholar.google.com`` and ``patents.google.com``. SERP wrappers from
-# ``www.google.com`` are caught by ``_should_skip`` via an exact-host
-# check below.
+# ``patents.google.com``. SERP wrappers from ``www.google.com`` are caught
+# by ``_should_skip`` via an exact-host check below.
 SKIP_DOMAINS = {
     "facebook.com", "twitter.com", "x.com", "instagram.com",
     "tiktok.com", "pinterest.com", "reddit.com", "quora.com",
     "linkedin.com",  # ToS prohibits scraping
+    # Their terms forbid automated access, and every URL kept here is fetched downstream.
+    "scholar.google.com", "researchgate.net", "academia.edu",
     "amazon.com", "ebay.com", "walmart.com",
     "play.google.com", "apps.apple.com",
     "wikipedia.org",
@@ -97,11 +107,10 @@ SKIP_EXACT_HOSTS = {
 
 # Domains the *legend* pipeline marks as noise (listing pages with no
 # article body) but that ARE valuable for an OSU faculty enrichment
-# context — Google Scholar / Semantic Scholar profile pages are exactly
-# what we want for an active researcher. We override the shared
-# is_noise_domain blocklist for these.
+# context — Semantic Scholar profile pages are exactly what we want for
+# an active researcher. We override the shared is_noise_domain blocklist
+# for these.
 NOISE_OVERRIDE_ALLOW = {
-    "scholar.google.com",
     "semanticscholar.org",
 }
 
@@ -112,10 +121,8 @@ PRIORITY_DOMAINS = [
     # Author identity
     "orcid.org",
     # Citation databases
-    "scholar.google.com",
     "semanticscholar.org",
     "openalex.org",
-    "researchgate.net",
     # Preprint / OA
     "arxiv.org", "biorxiv.org", "medrxiv.org",
     "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov",
@@ -136,12 +143,13 @@ PRIORITY_DOMAINS = [
 
 SCHOLAR_IDENTITY_DOMAINS = {
     "orcid.org",
-    "scholar.google.com",
     "semanticscholar.org",
     "openalex.org",
-    "researchgate.net",
     "dblp.org",
 }
+
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_MAX_COUNT = 20  # the API's cap on results per request
 
 BAD_RESULT_PATTERNS = (
     "obituary",
@@ -312,7 +320,6 @@ def _identity_keywords(scholar: Dict[str, Any]) -> Dict[str, str]:
     bg = scholar.get("background_and_work") or {}
     source_url = str(scholar.get("_excel_source_url") or "").strip()
     email = str(scholar.get("_excel_email") or "").strip().lower()
-    email_local = email.split("@", 1)[0] if "@" in email else ""
     expertise = str(scholar.get("_excel_expertise") or "").strip()
     return {
         "name": name.strip(),
@@ -332,7 +339,6 @@ def _identity_keywords(scholar: Dict[str, Any]) -> Dict[str, str]:
         "source_host": _domain_of(source_url),
         "source_path_token": _source_path_token(source_url),
         "email": email,
-        "email_local": email_local,
         "expertise": expertise,
     }
 
@@ -345,6 +351,9 @@ def _build_queries(idk: Dict[str, str], aggressive: bool = False) -> List[str]:
     (identity-domain site: queries, CV/lab/award/news/publication angles,
     etc.) to lift richness and quantity for weak scholars. Accuracy is
     unaffected — every candidate still passes ``_identity_match_osu``.
+
+    No query searches for a person by their email handle, and none asks
+    for Google Scholar or ResearchGate pages: those sites are never fetched.
     """
     name = idk["name"]
     if not name:
@@ -359,18 +368,15 @@ def _build_queries(idk: Dict[str, str], aggressive: bool = False) -> List[str]:
         f'{base} {osu} site:osu.edu',
         f'{base} site:experts.osu.edu',
         f'{base} {osu} ORCID',
-        f'{base} {osu} "Google Scholar"',
     ]
     if idk["source_host"]:
         queries.append(f'{base} site:{idk["source_host"]}')
-    if idk["email_local"]:
-        queries.append(f'"{idk["email_local"]}" {base} {osu}')
     if idk["department"]:
         queries.append(f'{base} {osu} "{idk["department"]}"')
     if idk["field"]:
         queries.append(f'{base} {osu} "{idk["field"]}"')
     if idk["research_focus"]:
-        # Truncate so DDG accepts it; keep it under ~250 chars.
+        # Truncate so the search API accepts it; keep it under ~250 chars.
         queries.append(f'{base} {osu} {idk["research_focus"][:80]}')
     if idk["current_position"]:
         queries.append(f'{base} {osu} {idk["current_position"][:60]}')
@@ -382,10 +388,8 @@ def _build_queries(idk: Dict[str, str], aggressive: bool = False) -> List[str]:
         # high-value academic profiles that drive "richness".
         queries += [
             f'{base} site:orcid.org',
-            f'{base} site:scholar.google.com',
             f'{base} site:semanticscholar.org',
             f'{base} site:openalex.org',
-            f'{base} {osu} site:researchgate.net',
             f'{base} site:dblp.org',
             f'{base} site:pubmed.ncbi.nlm.nih.gov',
             f'{base} site:arxiv.org',
@@ -409,8 +413,6 @@ def _build_queries(idk: Dict[str, str], aggressive: bool = False) -> List[str]:
             queries.append(f'{base} site:osu.edu "{idk["department"]}"')
         if idk["field"]:
             queries.append(f'{base} {idk["field"]} Ohio State research')
-        if idk["last"] and idk["email_local"]:
-            queries.append(f'{base} {idk["email_local"]} site:osu.edu')
 
     # Dedupe while preserving order.
     seen = set()
@@ -425,7 +427,7 @@ def _build_queries(idk: Dict[str, str], aggressive: bool = False) -> List[str]:
 
 
 def _identity_match(result: Dict[str, str], idk: Dict[str, str]) -> bool:
-    """Does this DDG result actually look like our scholar?
+    """Does this search result actually look like our scholar?
 
     Identity signal sources (any of these counts as "subject named"):
       - full name appears in title/snippet
@@ -586,30 +588,47 @@ def _identity_match_osu(result: Dict[str, str], idk: Dict[str, str]) -> bool:
     return False
 
 
-# ── DDG client (mirrors the existing two-tier pattern) ────────────────
+# ── Search client ──────────────────────────────────────────────────────
+
+_warned_no_search_key = False
 
 
-async def _ddg_search(query: str, max_results: int) -> List[Dict[str, str]]:
-    """Run one DDG query. Returns [] on rate-limit / failure."""
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        logger.error("duckduckgo-search not installed: pip install duckduckgo-search")
+async def brave_search(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Run one Brave Search API query: [{url, title, snippet: ""}].
+
+    Search engines' terms forbid automated results scraping; Brave's API is
+    the permitted route. Without BRAVE_SEARCH_API, or on any failure, the
+    answer is [] (logged). Only result URLs and titles are used; the API's
+    snippets are not kept.
+    """
+    global _warned_no_search_key
+    key = os.getenv("BRAVE_SEARCH_API", "").strip()
+    if not key:
+        if not _warned_no_search_key:
+            logger.warning("BRAVE_SEARCH_API is not set; web search is skipped and returns no results")
+            _warned_no_search_key = True
         return []
-    loop = asyncio.get_event_loop()
     try:
-        results = await loop.run_in_executor(
-            None, lambda: list(DDGS().text(query, max_results=max_results))
-        )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), headers={"User-Agent": USER_AGENT}) as client:
+            resp = await client.get(
+                BRAVE_ENDPOINT,
+                params={"q": query, "count": max(1, min(int(max_results), BRAVE_MAX_COUNT))},
+                headers={"X-Subscription-Token": key, "Accept": "application/json"},
+            )
+        if resp.status_code != 200:
+            logger.warning("Search API answered %s for %r", resp.status_code, query[:80])
+            return []
+        results = ((resp.json() or {}).get("web") or {}).get("results") or []
     except Exception as e:
-        logger.warning("DDG query failed (%s): %s", query[:80], str(e)[:120])
+        logger.warning("Search query failed (%s): %s", query[:80], str(e)[:120])
         return []
     out: List[Dict[str, str]] = []
     for r in results:
-        url = r.get("href") or r.get("url") or ""
+        url = (r or {}).get("url") or ""
         if not url:
             continue
-        out.append({"url": url, "title": r.get("title", ""), "snippet": r.get("body", "")})
+        title = re.sub(r"<[^>]+>", "", str(r.get("title") or ""))
+        out.append({"url": url, "title": title, "snippet": ""})
     return out
 
 
@@ -669,7 +688,7 @@ async def collect_for_scholar(
         }
 
     for q in queries:
-        results = await _ddg_search(q, per_query)
+        results = await brave_search(q, per_query)
         raw += len(results)
         for r in results:
             url = r.get("url", "")
@@ -814,7 +833,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     print(f"[Collect] Targeting {len(scholars)} OSU scholars")
     if args.dry_run:
-        print("[Collect] DRY RUN — no DDG calls, no writes.")
+        print("[Collect] DRY RUN — no search calls, no writes.")
         for sch in scholars[:10]:
             idk = _identity_keywords(sch)
             print(f"  - {idk['name']!r:35s} field={idk['field']!r:30s} dept={idk['department']!r:30s}")
@@ -899,7 +918,7 @@ async def main_async(args: argparse.Namespace) -> int:
         with out_file.open("w", encoding="utf-8") as f:
             for u in urls:
                 f.write(u + "\n")
-        collector_version = "ddg_v3_osu_aggressive" if args.aggressive else "ddg_v2_osu_precision"
+        collector_version = "brave_v1_osu_aggressive" if args.aggressive else "brave_v1_osu_precision"
         meta_payload = {
             "profile_id": pid,
             "profile_name": name,
@@ -960,8 +979,8 @@ def main() -> int:
     parser.add_argument("--start-from", type=int, default=0, help="Skip first M scholars")
     parser.add_argument("--excel-path", default=DEFAULT_EXCEL_PATH, help="Canonical OSU workbook for identity context")
     parser.add_argument("--max-urls", type=int, default=DEFAULT_MAX_URLS, help=f"URL cap per scholar (default {DEFAULT_MAX_URLS})")
-    parser.add_argument("--sleep-seconds", type=float, default=DEFAULT_SLEEP_S, help="Sleep between DDG queries")
-    parser.add_argument("--per-query-results", type=int, default=DEFAULT_PER_QUERY, help="Results pulled per DDG query")
+    parser.add_argument("--sleep-seconds", type=float, default=DEFAULT_SLEEP_S, help="Sleep between search API queries")
+    parser.add_argument("--per-query-results", type=int, default=DEFAULT_PER_QUERY, help=f"Results pulled per search API query (at most {BRAVE_MAX_COUNT})")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--checkpoint-file", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--log-file", default=DEFAULT_LOG)

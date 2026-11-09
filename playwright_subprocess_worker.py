@@ -7,6 +7,13 @@ Responsibilities:
 - Download CV documents (HTML or binary) and extract text when possible.
 - Detect personal website links, recursively crawl a few pages, and extract text.
 - Return structured JSON to the controller with defensive defaults.
+
+Every request follows enrichment/crawl_policy: our own name (never a
+browser's), only pages robots.txt allows (checked before each navigation and
+each redirect, with its Crawl-delay kept), never a site whose terms forbid
+automated access, and a 401/403/429 or a bot-check page is the site's answer -
+recorded as a refusal, not retried in a browser or under another identity.
+The browser fallback is only for pages that need JavaScript to render.
 """
 
 import io
@@ -28,18 +35,50 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from bs4 import BeautifulSoup, Tag
 
+from enrichment.crawl_policy import USER_AGENT, SyncRobotsPolicy, fetch_robots_txt, is_challenge_page
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
+    # Our own name on every request, so a site can tell who we are and ask us to stop.
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
 
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
 SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+
+# robots.txt is read with the same TLS settings as the pages it governs.
+ROBOTS = SyncRobotsPolicy(fetch=lambda robots_url: fetch_robots_txt(robots_url, context=SSL_CONTEXT))
+
+# Their terms forbid automated access: never fetched, whatever page links to them.
+TERMS_FORBID_AUTOMATED_ACCESS = (
+    "scholar.google.",
+    "researchgate.net",
+    "academia.edu",
+    "linkedin.com",
+    "ratemyprofessors.com",
+)
+
+# The site saying no. Final: never retried in a browser or under another identity.
+REFUSAL_STATUSES = (401, 403, 429)
+
+# Bot checks and block pages are refusals too (crawl_policy.is_challenge_page
+# catches the common ones; these are the ones this worker has met).
+REFUSAL_TEXT_PATTERNS = (
+    "request unsuccessful",
+    "incapsula incident id",
+    "access denied",
+    "verify you are human",
+    "captcha",
+    "attention required",
+    "checking your browser",
+    "security check",
+    "not a robot",
+)
+
+# A site whose Crawl-delay asks for a longer wait than this between pages has
+# only its first page read in a job; the rest are skipped, not fetched sooner.
+MAX_CRAWL_DELAY_WAIT_S = 20.0
 
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg", ".ico",
@@ -94,6 +133,76 @@ def is_document_url(url: str) -> bool:
     return path.endswith((".pdf", ".doc", ".docx"))
 
 
+def not_fetchable(url: str) -> Optional[str]:
+    """Why url must not be fetched, or None when it may be: not a web URL,
+    a site whose terms forbid automated access, or a page robots.txt
+    disallows (an unreadable robots.txt disallows for now)."""
+    try:
+        parts = urllib.parse.urlsplit(url or "")
+    except Exception:
+        return "not_a_web_url"
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return "not_a_web_url"
+    host = (parts.hostname or "").lower()
+    if any(marker in host for marker in TERMS_FORBID_AUTOMATED_ACCESS):
+        return "terms_forbid_automated_access"
+    if not ROBOTS.allows(url):
+        return "robots_disallowed"
+    return None
+
+
+def is_refusal_text(text: str) -> bool:
+    """A bot-check or block page served in place of the content."""
+    if not text:
+        return False
+    if is_challenge_page(text):
+        return True
+    sample = text.lower()
+    return any(pattern in sample for pattern in REFUSAL_TEXT_PATTERNS)
+
+
+def refusal_meta(reason: str, *, fetcher: str, start: float, status_code: Optional[int] = None) -> Dict:
+    """Fetch metadata for a page we did not (or will not) take: refused is final."""
+    return {
+        "status_code": status_code,
+        "error": reason,
+        "refused": True,
+        "fetcher": fetcher,
+        "fetched_at": utc_now_iso(),
+        "duration_ms": int((time.time() - start) * 1000),
+    }
+
+
+def is_refused(meta: Optional[Dict]) -> bool:
+    return bool((meta or {}).get("refused"))
+
+
+class NotFetchable(Exception):
+    """A redirect led to a page we may not fetch; it is not requested."""
+
+    def __init__(self, url: str, reason: str):
+        super().__init__(f"{reason}: {url}")
+        self.url = url
+        self.reason = reason
+
+
+class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to a page we may fetch."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        reason = not_fetchable(newurl)
+        if reason:
+            try:
+                fp.close()
+            except Exception:
+                pass
+            raise NotFetchable(newurl, reason)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=SSL_CONTEXT), _PolicyRedirectHandler())
+
+
 class ScraperWorker:
     MAX_OLLAMA_CALLS = 3
     OLLAMA_TIMEOUT = 2.0
@@ -107,6 +216,7 @@ class ScraperWorker:
         self.ollama_calls = 0
         self.personal_site_cache: Dict[str, bool] = {}
         self._tesseract_available = shutil.which("tesseract") is not None
+        self.last_fetch_at: Dict[str, float] = {}
 
     @staticmethod
     def is_blocked_or_placeholder_text(text: str) -> bool:
@@ -115,12 +225,65 @@ class ScraperWorker:
             return False
         return any(pattern in sample for pattern in BLOCKED_TEXT_PATTERNS)
 
-    def storage_state_path(self, url: str) -> str:
-        host = urllib.parse.urlparse(url).netloc.lower().replace(":", "_")
-        host = re.sub(r"[^a-z0-9._-]+", "_", host) or "default"
-        root = os.path.join(tempfile.gettempdir(), "ngo_automation_playwright_state")
-        os.makedirs(root, exist_ok=True)
-        return os.path.join(root, f"{host}.json")
+    def pace(self, url: str) -> bool:
+        """Wait out the Crawl-delay robots.txt asks between our requests to a
+        site. False when the wait is longer than a job can give: the page is
+        skipped rather than fetched sooner than the site asked."""
+        host = urllib.parse.urlsplit(url).netloc.lower()
+        delay = ROBOTS.crawl_delay(url) or 0.0
+        last = self.last_fetch_at.get(host)
+        if last is not None and delay > 0:
+            wait = delay - (time.monotonic() - last)
+            if wait > MAX_CRAWL_DELAY_WAIT_S:
+                return False
+            if wait > 0:
+                time.sleep(wait)
+        self.last_fetch_at[host] = time.monotonic()
+        return True
+
+    def admit(self, url: str, *, fetcher: str, start: float) -> Optional[Dict]:
+        """None when url may be fetched now; else the refusal to record."""
+        reason = not_fetchable(url)
+        if not reason and not self.pace(url):
+            reason = "crawl_delay_longer_than_job"
+        if reason:
+            log(f"Not fetched ({reason}): {url}")
+            return refusal_meta(reason, fetcher=fetcher, start=start)
+        return None
+
+    @staticmethod
+    def _route_handler(route) -> None:
+        """Skip images, media and fonts; let a navigation (a link, a script, a
+        frame, a download) go only where we may fetch."""
+        try:
+            request = route.request
+            if request.resource_type in {"image", "media", "font"}:
+                route.abort()
+            elif request.is_navigation_request() and not_fetchable(request.url):
+                log(f"Navigation not followed: {request.url}")
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            try:
+                route.abort()
+            except Exception:
+                pass
+
+    @staticmethod
+    def response_is_refusal(response) -> bool:
+        """A Playwright navigation answered with a refusal status or a bot check."""
+        if response is None:
+            return False
+        if getattr(response, "status", None) in REFUSAL_STATUSES:
+            return True
+        try:
+            ctype = (response.headers.get("content-type") or "").lower()
+            if "html" in ctype:
+                return is_refusal_text(response.text()[:8000])
+        except Exception:
+            return False
+        return False
 
     def extract_urls_from_text(self, text: str) -> List[str]:
         if not text:
@@ -157,9 +320,13 @@ class ScraperWorker:
         kind: "html", "binary", or "error".
         """
         start = time.time()
+        refused = self.admit(url, fetcher="urllib", start=start)
+        if refused:
+            return "error", None, None, None, refused
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=timeout) as resp:
+            # OPENER follows a redirect only to a page we may fetch.
+            with OPENER.open(req, timeout=timeout) as resp:
                 final_url = resp.geturl()
                 content_type = (resp.headers.get("Content-Type") or "").lower()
                 raw = resp.read()
@@ -189,26 +356,32 @@ class ScraperWorker:
             if len(text) < 50:
                 return "error", None, final_url, None, meta
 
+            if is_refusal_text(text):
+                # A bot check is the site's answer, not a page to get past.
+                meta["error"] = "bot_check_page"
+                meta["refused"] = True
+                return "error", None, final_url, None, meta
+
             if self.is_blocked_or_placeholder_text(text):
                 meta["error"] = "blocked_or_placeholder_content"
                 return "error", text, final_url, None, meta
 
             return "html", text, final_url, None, meta
+        except NotFetchable as e:
+            log(f"Redirect not followed ({e.reason}): {e.url}")
+            return "error", None, None, None, refusal_meta(f"redirect_{e.reason}", fetcher="urllib", start=start)
         except urllib.error.HTTPError as e:
-            # Handle 403 Forbidden and other HTTP errors
-            if e.code == 403:
-                log(f"HTTP 403 Forbidden for {url} - trying Playwright fallback")
-                # Try Playwright as fallback for 403 errors
-                playwright_result = self.fetch_playwright(url, timeout=timeout)
-                if playwright_result[0] != "error":
-                    return playwright_result
-                return "error", None, None, None, {
-                    "status_code": 403,
-                    "error": "HTTP 403 Forbidden",
-                    "fetcher": "urllib",
-                    "fetched_at": utc_now_iso(),
-                    "duration_ms": int((time.time() - start) * 1000),
-                }
+            body = ""
+            try:
+                body = e.read(8000).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if e.code in REFUSAL_STATUSES or is_challenge_page(body):
+                # The site said no: final, never retried in a browser or under another identity.
+                log(f"HTTP {e.code} for {url} - refused; not retried")
+                return "error", None, None, None, refusal_meta(
+                    f"refused (HTTP {e.code})", fetcher="urllib", start=start, status_code=e.code
+                )
             log(f"HTTP Error {e.code} for {url}: {e}")
             return "error", None, None, None, {
                 "status_code": e.code,
@@ -229,10 +402,14 @@ class ScraperWorker:
 
     def fetch_playwright(self, url: str, timeout: int = 30) -> Tuple[str, Optional[str], Optional[str], Optional[bytes], Dict]:
         """
-        Optional Playwright fetch when urllib yields poor HTML (short/blocked).
+        Optional Playwright fetch when urllib yields poor HTML (short, or a
+        page that needs JavaScript) - never for a page that refused us.
         Returns same tuple schema.
         """
         start = time.time()
+        refused = self.admit(url, fetcher="playwright", start=start)
+        if refused:
+            return "error", None, None, None, refused
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
         except Exception:
@@ -248,10 +425,8 @@ class ScraperWorker:
             try:
                 if not self.playwright:
                     self.playwright = sync_playwright().start()
-                self.browser = self.playwright.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
+                # A plain headless browser: nothing hides that it is automated.
+                self.browser = self.playwright.chromium.launch(headless=True)
             except Exception as exc:
                 self.browser = None
                 return "error", None, None, None, {
@@ -275,54 +450,32 @@ class ScraperWorker:
                 "duration_ms": int((time.time() - start) * 1000),
             }
 
-        state_path = self.storage_state_path(url)
         context = None
         page = None
         try:
-            context_kwargs = {
-                "accept_downloads": True,
-                "java_script_enabled": True,
-                "locale": "en-US",
-                "timezone_id": "America/Chicago",
-                "user_agent": HEADERS["User-Agent"],
-                "extra_http_headers": {
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "DNT": "1",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-                "service_workers": "block",
-                "viewport": {"width": 1366, "height": 1900},
-            }
-            if os.path.exists(state_path):
-                context_kwargs["storage_state"] = state_path
-            context = self.browser.new_context(**context_kwargs)
-            context.add_init_script(
-                """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = window.chrome || { runtime: {} };
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                """
+            # Our own name, and a fresh context each time: no cookies carried
+            # between runs, which is how a passed bot check would be reused.
+            context = self.browser.new_context(
+                accept_downloads=True,
+                java_script_enabled=True,
+                locale="en-US",
+                user_agent=USER_AGENT,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                service_workers="block",
+                viewport={"width": 1366, "height": 1900},
             )
-
-            def _route_handler(route):
-                try:
-                    if route.request.resource_type in {"image", "media", "font"}:
-                        route.abort()
-                    else:
-                        route.continue_()
-                except Exception:
-                    try:
-                        route.continue_()
-                    except Exception:
-                        pass
-
-            context.route("**/*", _route_handler)
+            context.route("**/*", self._route_handler)
             page = context.new_page()
             downloads = []
             page.on("download", lambda download: downloads.append(download))
 
             response = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            if self.response_is_refusal(response):
+                status = getattr(response, "status", None)
+                log(f"Playwright: {url} refused us (HTTP {status}) - not retried")
+                return "error", None, None, None, refusal_meta(
+                    f"refused (HTTP {status})", fetcher="playwright", start=start, status_code=status
+                )
             try:
                 page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 10000))
             except Exception:
@@ -334,6 +487,10 @@ class ScraperWorker:
             except Exception:
                 pass
             final_url = page.url
+            # A redirect is not seen by the route check; its target is checked here.
+            landed = not_fetchable(final_url) if normalize_url(final_url) != normalize_url(url) else None
+            if landed:
+                return "error", None, None, None, refusal_meta(f"redirect_{landed}", fetcher="playwright", start=start)
             meta = {
                 "status_code": getattr(response, "status", None) if response else None,
                 "content_type": (response.headers.get("content-type") if response else None),
@@ -364,12 +521,10 @@ class ScraperWorker:
                     body = b""
                 return "binary", None, final_url, body or None, meta
             html = page.content()
+            if is_refusal_text(html):
+                return "error", None, None, None, refusal_meta("bot_check_page", fetcher="playwright", start=start)
             if meta is not None:
                 meta["content_length"] = len(html) if html else 0
-            try:
-                context.storage_state(path=state_path)
-            except Exception:
-                pass
             return "html", html, final_url, None, meta
         except Exception as exc:
             try:
@@ -401,6 +556,9 @@ class ScraperWorker:
         Playwright fetch tuned for CV/doc links. Attempts to get binary body if possible.
         """
         start = time.time()
+        refused = self.admit(url, fetcher="playwright", start=start)
+        if refused:
+            return "error", None, None, None, refused
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
         except Exception:
@@ -416,10 +574,8 @@ class ScraperWorker:
             try:
                 if not self.playwright:
                     self.playwright = sync_playwright().start()
-                self.browser = self.playwright.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
+                # A plain headless browser: nothing hides that it is automated.
+                self.browser = self.playwright.chromium.launch(headless=True)
             except Exception as exc:
                 self.browser = None
                 return "error", None, None, None, {
@@ -443,58 +599,40 @@ class ScraperWorker:
                 "duration_ms": int((time.time() - start) * 1000),
             }
 
-        state_path = self.storage_state_path(url)
         context = None
         page = None
         try:
-            context_kwargs = {
-                "accept_downloads": True,
-                "java_script_enabled": True,
-                "locale": "en-US",
-                "timezone_id": "America/Chicago",
-                "user_agent": HEADERS["User-Agent"],
-                "extra_http_headers": {
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "DNT": "1",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-                "service_workers": "block",
-                "viewport": {"width": 1366, "height": 1900},
-            }
-            if os.path.exists(state_path):
-                context_kwargs["storage_state"] = state_path
-            context = self.browser.new_context(**context_kwargs)
-            context.add_init_script(
-                """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = window.chrome || { runtime: {} };
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                """
+            # Our own name, and a fresh context each time: no cookies carried
+            # between runs, which is how a passed bot check would be reused.
+            context = self.browser.new_context(
+                accept_downloads=True,
+                java_script_enabled=True,
+                locale="en-US",
+                user_agent=USER_AGENT,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                service_workers="block",
+                viewport={"width": 1366, "height": 1900},
             )
-
-            def _route_handler(route):
-                try:
-                    if route.request.resource_type in {"image", "media", "font"}:
-                        route.abort()
-                    else:
-                        route.continue_()
-                except Exception:
-                    try:
-                        route.continue_()
-                    except Exception:
-                        pass
-
-            context.route("**/*", _route_handler)
+            context.route("**/*", self._route_handler)
             page = context.new_page()
             downloads = []
             page.on("download", lambda download: downloads.append(download))
             response = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            if self.response_is_refusal(response):
+                status = getattr(response, "status", None)
+                log(f"Playwright: {url} refused us (HTTP {status}) - not retried")
+                return "error", None, None, None, refusal_meta(
+                    f"refused (HTTP {status})", fetcher="playwright", start=start, status_code=status
+                )
             try:
                 page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 12000))
             except Exception:
                 pass
             page.wait_for_timeout(1200)
+            # A redirect is not seen by the route check; its target is checked here.
+            landed = not_fetchable(page.url) if normalize_url(page.url) != normalize_url(url) else None
+            if landed:
+                return "error", None, None, None, refusal_meta(f"redirect_{landed}", fetcher="playwright", start=start)
             if response:
                 final_url = response.url
                 ctype = (response.headers.get("content-type") or "").lower()
@@ -537,7 +675,13 @@ class ScraperWorker:
                     if "download=1" not in download_url:
                         download_url = f"{download_url}{'&' if '?' in download_url else '?'}download=1"
                     try:
-                        api_resp = page.request.get(download_url, timeout=timeout * 1000)
+                        if not_fetchable(download_url):
+                            raise NotFetchable(download_url, "robots_or_terms")
+                        api_resp = page.request.get(
+                            download_url, timeout=timeout * 1000, headers={"User-Agent": USER_AGENT}
+                        )
+                        if api_resp.status in REFUSAL_STATUSES:
+                            raise NotFetchable(download_url, f"refused (HTTP {api_resp.status})")
                         api_ct = (api_resp.headers.get("content-type") or "").lower()
                         api_body = api_resp.body()
                         if api_body and (api_body.startswith(b"%PDF") or "pdf" in api_ct or download_url.lower().endswith(".pdf")):
@@ -561,6 +705,8 @@ class ScraperWorker:
                     likely_doc = is_document_url(candidate_url) or any(tok in text for tok in ["download", "curriculum vitae", "cv", "resume"])
                     if not likely_doc:
                         continue
+                    if candidate_url and not_fetchable(candidate_url):
+                        continue
                     if candidate_url and is_document_url(candidate_url):
                         ck, _, cf, cb, cm = self.fetch(candidate_url, timeout=timeout)
                         if ck == "binary" and cb:
@@ -583,18 +729,14 @@ class ScraperWorker:
 
                 # Else treat as html
                 html = page.content()
-                try:
-                    context.storage_state(path=state_path)
-                except Exception:
-                    pass
+                if is_refusal_text(html):
+                    return "error", None, None, None, refusal_meta("bot_check_page", fetcher="playwright", start=start)
                 return "html", html, final_url, None, meta
 
             html = page.content()
             final_url = page.url
-            try:
-                context.storage_state(path=state_path)
-            except Exception:
-                pass
+            if is_refusal_text(html):
+                return "error", None, None, None, refusal_meta("bot_check_page", fetcher="playwright", start=start)
             return "html", html, final_url, None, {
                 "status_code": None,
                 "content_type": None,
@@ -1096,6 +1238,11 @@ class ScraperWorker:
             )
             return result
 
+        # A refusal (robots.txt, a 401/403/429, a bot check) is final: no browser retry.
+        if is_refused(meta):
+            result.update({"status": "refused", "note": (meta or {}).get("error", "")})
+            return result
+
         # If urllib gave binary/html ok, return immediately
         if kind == "binary":
             return success_from_binary(binary)
@@ -1115,6 +1262,9 @@ class ScraperWorker:
             if pmeta:
                 result["fetch_metadata"] = pmeta
                 result["fetch_attempts"].append(pmeta)
+            if is_refused(pmeta):
+                result.update({"status": "refused", "note": pmeta.get("error", "")})
+                return result
 
             if pkind == "binary":
                 return success_from_binary(pbinary)
@@ -1273,7 +1423,9 @@ class ScraperWorker:
         self.visited.add(url)
 
         kind, html, final_url, _, meta = self.fetch(url)
-        # fallback to Playwright if fetch failed or very short
+        if is_refused(meta):
+            return {"url": url, "status": "refused", "note": meta.get("error", "")}
+        # fallback to Playwright if fetch failed or very short (a page that needs JavaScript)
         if kind != "html" or not html or len(html) < 200 or self.is_blocked_or_placeholder_text(html):
             pkind, phtml, pfinal, _, pmeta = self.fetch_playwright(url)
             if pkind == "html" and phtml and not self.is_blocked_or_placeholder_text(phtml):
@@ -1329,6 +1481,9 @@ class ScraperWorker:
         log(f"Job start: {url}")
 
         kind, html, final_url, binary, meta = self.fetch(url)
+        if is_refused(meta):
+            self.stop_playwright()
+            return {"status": "error", "error": f"Not fetched: {meta.get('error', 'refused')}", "refused": True}
         if kind == "binary":
             document_text = self.extract_document_text(
                 binary or b"",
@@ -1404,7 +1559,7 @@ class ScraperWorker:
             return {"status": "error", "error": "Failed to extract text from binary seed"}
 
         if kind != "html" or not html or len(html) < 300 or self.is_blocked_or_placeholder_text(html):
-            # fallback to Playwright if available
+            # fallback to Playwright for a page that needs JavaScript to render
             pkind, phtml, pfinal, _, pmeta = self.fetch_playwright(url)
             if pkind == "html" and phtml and not self.is_blocked_or_placeholder_text(phtml):
                 kind, html, final_url, meta = pkind, phtml, pfinal, pmeta

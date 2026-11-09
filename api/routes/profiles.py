@@ -20,19 +20,17 @@ CHUNKS_DIR = Path(__file__).parent.parent.parent / "output" / "osu_faculty_run" 
 
 ALL_SOURCES = [
     "orcid", "osu_expertise", "semantic_scholar", "openalex", "crossref",
-    "google_scholar", "nsf_grants", "nih_grants", "osu_courses",
-    "rate_my_professor", "osu_news", "google_news", "youtube_lectures",
+    "nsf_grants", "nih_grants", "osu_courses",
+    "osu_news", "google_news", "youtube_lectures",
 ]
 
 SOURCE_LABELS = {
     "semantic_scholar": "Semantic Scholar",
     "openalex": "OpenAlex",
-    "google_scholar": "Google Scholar",
     "crossref": "CrossRef",
     "orcid": "ORCID",
     "nsf_grants": "NSF Grants",
     "nih_grants": "NIH Grants",
-    "rate_my_professor": "RateMyProfessors",
     "osu_courses": "OSU Courses",
     "osu_news": "OSU News",
     "google_news": "Google News",
@@ -43,12 +41,10 @@ SOURCE_LABELS = {
 SOURCE_ICONS = {
     "semantic_scholar": "S2",
     "openalex": "OA",
-    "google_scholar": "GS",
     "crossref": "CR",
     "orcid": "OR",
     "nsf_grants": "NSF",
     "nih_grants": "NIH",
-    "rate_my_professor": "RMP",
     "osu_courses": "CRS",
     "osu_news": "ON",
     "google_news": "GN",
@@ -439,10 +435,10 @@ a.back:hover{text-decoration:underline}
   <div id="content"><div class="loading">Loading...</div></div>
 </div>
 <script>
-const SOURCE_LABELS={"semantic_scholar":"Semantic Scholar","openalex":"OpenAlex","google_scholar":"Google Scholar","crossref":"CrossRef","orcid":"ORCID","nsf_grants":"NSF Grants","nih_grants":"NIH Grants","rate_my_professor":"RateMyProfessors","osu_courses":"OSU Courses","osu_news":"OSU News","google_news":"Google News","youtube_lectures":"YouTube Lectures","osu_expertise":"OSU Expertise"};
-const SOURCE_ICONS={"semantic_scholar":"S2","openalex":"OA","google_scholar":"GS","crossref":"CR","orcid":"OR","nsf_grants":"NSF","nih_grants":"NIH","rate_my_professor":"RMP","osu_courses":"CRS","osu_news":"ON","google_news":"GN","youtube_lectures":"YT","osu_expertise":"EXP"};
-const ICON_COLORS={"semantic_scholar":"#2563eb","openalex":"#c026d3","google_scholar":"#4285f4","crossref":"#ea580c","orcid":"#a3c51c","nsf_grants":"#0369a1","nih_grants":"#0d9488","rate_my_professor":"#facc15","osu_courses":"#dc2626","osu_news":"#dc2626","google_news":"#ea4335","youtube_lectures":"#ff0000","osu_expertise":"#bb1632"};
-const ALL_SOURCES=["orcid","osu_expertise","semantic_scholar","openalex","crossref","google_scholar","nsf_grants","nih_grants","osu_courses","rate_my_professor","osu_news","google_news","youtube_lectures"];
+const SOURCE_LABELS={"semantic_scholar":"Semantic Scholar","openalex":"OpenAlex","crossref":"CrossRef","orcid":"ORCID","nsf_grants":"NSF Grants","nih_grants":"NIH Grants","osu_courses":"OSU Courses","osu_news":"OSU News","google_news":"Google News","youtube_lectures":"YouTube Lectures","osu_expertise":"OSU Expertise"};
+const SOURCE_ICONS={"semantic_scholar":"S2","openalex":"OA","crossref":"CR","orcid":"OR","nsf_grants":"NSF","nih_grants":"NIH","osu_courses":"CRS","osu_news":"ON","google_news":"GN","youtube_lectures":"YT","osu_expertise":"EXP"};
+const ICON_COLORS={"semantic_scholar":"#2563eb","openalex":"#c026d3","crossref":"#ea580c","orcid":"#a3c51c","nsf_grants":"#0369a1","nih_grants":"#0d9488","osu_courses":"#dc2626","osu_news":"#dc2626","google_news":"#ea4335","youtube_lectures":"#ff0000","osu_expertise":"#bb1632"};
+const ALL_SOURCES=["orcid","osu_expertise","semantic_scholar","openalex","crossref","nsf_grants","nih_grants","osu_courses","osu_news","google_news","youtube_lectures"];
 
 const pid=window.location.pathname.split('/').filter(Boolean).pop();
 
@@ -636,38 +632,6 @@ function renderSourceData(name,data){
       data.employment.forEach(e=>{
         h+='<div class="pub"><div class="title">'+esc(e.role_title||e.department||'')+'</div>';
         h+='<div class="detail">'+esc(e.organization||'')+' '+esc((e.start_year||'')+' - '+(e.end_year||'present'))+'</div></div>';
-      });
-      h+='</div>';
-    }
-    return h;
-  }
-
-  if(name==='rate_my_professor'){
-    h+='<div class="metrics">';
-    if(data.overall_rating!=null)h+=metric('Rating',data.overall_rating+' / 5');
-    if(data.difficulty_rating!=null)h+=metric('Difficulty',data.difficulty_rating+' / 5');
-    if(data.num_ratings!=null)h+=metric('Ratings',data.num_ratings);
-    if(data.would_take_again!=null)h+=metric('Would Take Again',data.would_take_again+'%');
-    h+='</div>';
-    if(data.top_tags&&data.top_tags.length){
-      h+='<div style="margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap">';
-      data.top_tags.forEach(t=>{
-        h+='<span style="background:#422006;color:#fbbf24;padding:3px 10px;border-radius:12px;font-size:.78em">'+esc(t)+'</span>';
-      });
-      h+='</div>';
-    }
-    if(data.reviews&&data.reviews.length){
-      h+='<div class="pub-list">';
-      data.reviews.slice(0,8).forEach(r=>{
-        h+='<div class="pub"><div class="text" style="color:#d1d5db;font-size:.88em">"'+esc(r.comment||r.review||'')+'"</div>';
-        const parts=[];
-        if(r.quality!=null)parts.push('Quality: '+r.quality);
-        if(r.difficulty!=null)parts.push('Difficulty: '+r.difficulty);
-        if(r.course)parts.push(r.course);
-        if(r.grade)parts.push('Grade: '+r.grade);
-        if(r.date)parts.push(r.date);
-        if(parts.length)h+='<div class="detail">'+parts.join(' &middot; ')+'</div>';
-        h+='</div>';
       });
       h+='</div>';
     }

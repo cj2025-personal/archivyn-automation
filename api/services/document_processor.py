@@ -5,10 +5,15 @@ Handles PDF, Word, and text file extraction
 import pdfplumber
 from docx import Document
 from typing import Dict, Optional
+from urllib.parse import urljoin
 import requests
 import os
 import tempfile
 from pathlib import Path
+
+from enrichment.crawl_policy import USER_AGENT, is_challenge_page, robots_allows
+
+MAX_REDIRECTS = 5
 
 
 class DocumentProcessor:
@@ -31,17 +36,17 @@ class DocumentProcessor:
             }
         """
         try:
-            # Download document with redirects and proper headers
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            # A document on someone else's site: fetched under our own name, and
+            # only where robots.txt allows it, each redirect included (crawl_policy).
+            headers = {'User-Agent': USER_AGENT}
             # Disable SSL verification for self-signed certificates (common on university servers)
             # Suppress urllib3 warnings about unverified HTTPS requests
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            response = requests.get(document_url, timeout=30, stream=True, headers=headers, allow_redirects=True, verify=False)
+            response = self._get_where_allowed(document_url, headers)
+            # A 401/403/429 raises here and is final: the site's answer, not retried.
             response.raise_for_status()
-            
+
             # Check if we got HTML instead of a document (common with SharePoint/auth pages)
             content_type = response.headers.get('content-type', '').lower()
             if 'text/html' in content_type:
@@ -50,6 +55,9 @@ class DocumentProcessor:
                 if b'%PDF' in first_bytes[:10] or b'PK\x03\x04' in first_bytes[:10]:
                     # It's actually a document, just mislabeled as HTML
                     pass
+                elif is_challenge_page(response.text):
+                    # A bot check is a refusal, not something to get past in a browser.
+                    raise PermissionError(f"{document_url} answered with a bot check; not retried")
                 else:
                     # It's really HTML (likely a login/redirect page)
                     # Try Playwright as fallback for auth-required documents
@@ -121,7 +129,21 @@ class DocumentProcessor:
                     # If Playwright also fails, raise the original error
                     raise Exception(f"Error processing document {document_url}: {error_msg} (Playwright fallback also failed: {str(playwright_error)})")
             raise Exception(f"Error processing document {document_url}: {error_msg}")
-    
+
+    @staticmethod
+    def _get_where_allowed(url: str, headers: Dict[str, str]) -> requests.Response:
+        """GET url, following a redirect only to a page robots.txt allows."""
+        for _ in range(MAX_REDIRECTS + 1):
+            if not robots_allows(url):
+                raise PermissionError(f"robots.txt disallows {url}; not fetched")
+            response = requests.get(url, timeout=30, stream=True, headers=headers, allow_redirects=False, verify=False)
+            if not response.is_redirect:
+                return response
+            location = response.headers.get('location', '')
+            response.close()
+            url = urljoin(url, location)
+        raise ValueError(f"more than {MAX_REDIRECTS} redirects")
+
     def _process_document_with_playwright(self, document_url: str) -> Dict:
         """
         Download document using Playwright (handles auth-required pages like SharePoint)

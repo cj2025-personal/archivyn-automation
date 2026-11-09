@@ -13,10 +13,7 @@ If the pipeline crashes at professor 2000, professors 1-1999 are fully
 persisted in Pinecone + MongoDB already.
 
 Usage:
-    # Install one extra dependency
-    pip install scholarly
-
-    # List all 13 data sources
+    # List all data sources
     python run_enrichment_pipeline.py --list-sources
 
     # Dry-run — see what will happen
@@ -38,7 +35,7 @@ Usage:
     python run_enrichment_pipeline.py --skip-mongodb
 
     # Disable slow sources
-    python run_enrichment_pipeline.py --disable google_scholar
+    python run_enrichment_pipeline.py --disable web_search
 
     # Force re-enrich already-done profiles
     python run_enrichment_pipeline.py --force --limit 50
@@ -383,20 +380,18 @@ def _print_sources():
     """Print all available data sources with descriptions."""
     source_descriptions = {
         # -- Original 13 --
-        "semantic_scholar": "Publications, citations, abstracts, h-index, co-authors (API, free)",
+        "semantic_scholar": "Citations, h-index, papers; found via OpenAlex DOIs (API, free; key advised)",
         "openalex": "Publications, concepts, institutions, citation networks (API, free)",
-        "google_scholar": "h-index, citation metrics, top papers (scraping, free, slow)",
         "crossref": "Full publication metadata, abstracts, funding info, DOIs (API, free)",
         "orcid": "Career history, education, employment, grants, peer reviews (API, free)",
         "nsf_grants": "NSF federal grants, amounts, abstracts (API, free)",
         "nih_grants": "NIH-funded grants, project details, funding (API, free)",
-        "rate_my_professor": "Student ratings, difficulty, reviews, course tags (GraphQL, free)",
-        "osu_courses": "Courses taught at OSU, descriptions, schedules (API, free)",
+        "osu_courses": "Courses taught at OSU and descriptions - no meeting times or rooms (API, free)",
         "osu_news": "OSU press releases and news articles (scraping, free)",
         "google_news": "News articles and media mentions (RSS, free)",
         "youtube_lectures": "Lectures, talks, interviews on YouTube (API, needs YOUTUBE_API_KEY)",
-        "osu_expertise": "OSU Experts directory + Knowledge Bank repository (scraping, free)",
-        "web_search": "DDG search + recursive scraping of faculty / lab / CV pages (free)",
+        "osu_expertise": "OSU Knowledge Bank: works authored, theses advised (API, free)",
+        "web_search": "Brave Search API + faculty / lab / CV pages robots.txt allows (needs BRAVE_SEARCH_API)",
         # -- New differentiator sources --
         "unpaywall": "Legal OA copies of paywalled DOIs (dependent on openalex/crossref)",
         "arxiv": "Preprint full-text metadata by author name (API, free)",
@@ -417,7 +412,6 @@ def _print_sources():
         "patentsview": "USPTO patents by inventor (PATENTSVIEW_API_KEY raises limits)",
         "clinicaltrials": "ClinicalTrials.gov studies with this researcher as PI (API, free)",
         "gdelt": "Global news index — mentions beyond Google News (API, free)",
-        "youtube_transcripts": "Full captions for lecture videos — depends on youtube_lectures",
     }
 
     # Dynamic: rely on ALL_COLLECTORS as the source of truth

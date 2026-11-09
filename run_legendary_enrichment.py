@@ -2,7 +2,7 @@
 End-to-end legendary scholar enrichment runner.
 
 Stages:
-  1. collect_legendary_scholar_urls.py -> DDG -> legendary_scholars/final/*.txt
+  1. collect_legendary_scholar_urls.py -> Wikipedia API + Brave Search API -> legendary_scholars/final/*.txt
   2. run_legend_scholar_pipeline.py over the collected .txt files
   3. sync successful chunked runs into Mongo collection legend_scholars (default)
 
@@ -183,7 +183,7 @@ def main() -> int:
 
     if not args.skip_collection:
         print("=" * 80)
-        print("[Legendary] Stage 1: collect URLs via DuckDuckGo")
+        print("[Legendary] Stage 1: collect URLs via Wikipedia and the Brave Search API")
         print("=" * 80)
         rc = subprocess.call(_build_collect_cmd(args))
         if rc != 0:

@@ -12,16 +12,19 @@ the `.env` file, and running the pipeline.
 pip install -r requirements.txt
 ```
 
-### Install the Playwright browser (needed for Tier 3 Cloudflare bypass)
+### Install the Playwright browser (for pages that need JavaScript)
 
 ```bash
 playwright install chromium
 ```
 
-> The bypass ladder is graceful-optional: if `curl_cffi` or the Playwright
-> browser is missing, the pipeline falls back to plain `httpx` and just logs
-> a warning. But without them the currently-blocked sources (Google Scholar,
-> Cloudflare-walled pages) won't be recovered.
+> How pages are fetched (`enrichment/crawl_policy.py`): every request says it
+> is `ProjArchBot` with a contact address; a page is fetched only where the
+> site's robots.txt allows it; a 401/403/429 or a bot-check page is the site's
+> answer and the page is skipped - never retried under another identity. Where
+> a site we need refuses us, ask its web team to allowlist ProjArchBot.
+> Google Scholar, RateMyProfessors, ResearchGate and YouTube captions are not
+> collected: their terms forbid automated access.
 
 ---
 
@@ -141,12 +144,11 @@ PMC_FULLTEXT_CAP=8000
 2. **APIs & Services** → **Library** → enable **YouTube Data API v3**.
 3. **Credentials** → **Create Credentials** → **API key**.
 4. Paste into `YOUTUBE_API_KEY`. Free quota: 10,000 units/day.
-5. Without this, `youtube_lectures` is disabled; `youtube_transcripts`
-   depends on it, so it's also disabled. This is the only "free but
-   required" key if you want YouTube coverage.
+5. Without this, `youtube_lectures` is disabled. This is the only "free but
+   required" key if you want YouTube coverage. (Captions are not collected.)
 
 ### 3.14 Semantic Scholar API Key — highly recommended
-The `semantic_scholar` collector is our most rate-limit-sensitive source. Without a key, S2 shares one bucket across all anonymous clients and will 429 you after ~3 quick calls.
+The `semantic_scholar` collector is our most rate-limit-sensitive source. Without a key, S2 shares one bucket across all anonymous clients and will 429 you after ~3 quick calls (the collector then says "Rate-limited", not "not found"). It runs after `openalex` and finds the scholar through the DOIs OpenAlex matched, so run both. Its license asks that "Semantic Scholar" be credited wherever its data is shown.
 
 **Steps:**
 1. Go to https://www.semanticscholar.org/product/api
@@ -160,13 +162,15 @@ The `semantic_scholar` collector is our most rate-limit-sensitive source. Withou
 
 ### Sources that need NO key at all
 The following collectors run out of the box with no signup:
-`web_search`, `semantic_scholar`, `openalex` (but email recommended),
+`semantic_scholar` (key advised), `openalex` (but email recommended),
 `orcid`, `crossref`, `nsf_grants`, `nih_grants`, `osu_courses`,
-`rate_my_professor`, `osu_news`, `google_news`, `osu_expertise`,
+`osu_news`, `google_news`, `osu_expertise` (OSU Knowledge Bank),
 `arxiv`, `biorxiv`, `wikidata`, `wikipedia`, `clinicaltrials`,
 `usaspending`, `opencitations`, `paperswithcode`, `figshare`, `osf`,
-`gdelt`, `unpaywall` (email only), `google_scholar` (but frequently
-blocked; relies on bypass).
+`gdelt`, `unpaywall` (email only).
+
+`web_search` needs `BRAVE_SEARCH_API` (the Brave Search API key the admin
+app already uses); search engines' results pages are not scraped.
 
 ---
 
@@ -182,7 +186,7 @@ python run_enrichment_pipeline.py --limit 5
 # Re-run ONLY the new collectors on already-enriched profiles, merging
 # with existing enrichment.json so you don't lose prior data:
 python run_enrichment_pipeline.py --limit 20 \
-  --re-enrich-sources youtube_transcripts,unpaywall,altmetric,opencitations,\
+  --re-enrich-sources unpaywall,altmetric,opencitations,\
 wikidata,wikipedia,github,patentsview,clinicaltrials,arxiv,biorxiv,pmc_oa,\
 zenodo,figshare,osf,usaspending,gdelt,huggingface,paperswithcode,core_api
 
@@ -195,7 +199,7 @@ python run_enrichment_pipeline.py --profile-id 01409eae-9cd1-4efc-bd7e-038818d41
 
 # Enrich only (no chunking / Pinecone / Mongo sync) — fastest feedback loop
 python run_enrichment_pipeline.py --limit 3 --skip-chunking \
-  --sources youtube_transcripts,unpaywall,wikidata,github,patentsview
+  --sources unpaywall,wikidata,github,patentsview
 ```
 
 Each profile writes:
@@ -240,22 +244,19 @@ cat output/osu_faculty_run/profiles/<profile_id>/enrichment.json | \
 
 ## 7. Troubleshooting
 
-**`ImportError: curl_cffi`** — run `pip install curl_cffi`. The bypass ladder
-will still work at Tier 1 (httpx direct) without it, but Cloudflare-walled
-pages will continue to fail.
-
 **`playwright._impl._errors.Error: Executable doesn't exist`** — run
 `playwright install chromium`.
 
-**`403 Forbidden` from Google Scholar** — expected; `google_scholar.py` now
-escalates to `curl_cffi`. If you still see 403, the Cloudflare challenge is
-stricter; set `bypass_tier="playwright"` explicitly for that collector.
+**"refused the bot (403)" / "robots.txt disallows"** — the site said no.
+Leave it, or ask the site's web team to allowlist `ProjArchBot`; do not work
+around it.
 
 **`core_api` always fails** — you didn't set `CORE_API_KEY`. That's fine;
 it's disabled automatically via `API_KEY_REQUIREMENTS`.
 
-**`youtube_transcripts` always fails** — check that `youtube_lectures` ran
-first and produced videos. Without upstream video IDs it has nothing to fetch.
+**`semantic_scholar`: "No OpenAlex works to identify the scholar by"** —
+OpenAlex did not match the scholar (or did not run first); S2 is not guessed
+from the name alone.
 
 **Pipeline very slow** — lower `max_concurrent` in the orchestrator
 constructor, or disable heavy collectors with

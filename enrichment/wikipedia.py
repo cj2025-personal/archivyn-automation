@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .base_collector import BaseCollector, CollectorResult, ProfessorQuery
+from .crawl_policy import USER_AGENT
 from .validation import normalize, strict_identity_match
 
 API = "https://en.wikipedia.org/w/api.php"
@@ -27,14 +28,13 @@ class WikipediaCollector(BaseCollector):
     async def get_client(self):
         # Wikimedia policy requires a contact-bearing User-Agent; generic UAs
         # get 403 on wikipedia.org/w/api.php.
-        import httpx, os
+        import httpx
         if self._client is None or self._client.is_closed:
-            email = os.getenv("OPENALEX_EMAIL") or os.getenv("UNPAYWALL_EMAIL") or "research@example.com"
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout),
                 follow_redirects=True,
                 headers={
-                    "User-Agent": f"OSU-scholar-enrichment/1.0 (research; {email})",
+                    "User-Agent": USER_AGENT,
                     "Accept": "application/json",
                 },
             )

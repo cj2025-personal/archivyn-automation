@@ -16,6 +16,9 @@ from .validation import names_match_from_query
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.openalex.org"
+# Licenses under which a work's abstract may be kept (OpenAlex license ids) - the
+# same set the admin app's source-text gate allows. Not -nc (we charge), not -nd.
+OPEN_LICENSES = {"cc-by", "cc-by-sa", "cc0", "public-domain"}
 
 
 class OpenAlexCollector(BaseCollector):
@@ -142,10 +145,14 @@ class OpenAlexCollector(BaseCollector):
 
         works = []
         for w in resp["results"]:
-            # Reconstruct abstract from inverted index
-            abstract = self._reconstruct_abstract(w.get("abstract_inverted_index"))
             location = w.get("primary_location") or {}
             source = location.get("source") or {}
+            # OpenAlex "does not ship plaintext abstracts for legal reasons": the
+            # text belongs to the authors and publishers. Rebuild it only for a
+            # work published under an open license; the rest keep facts only.
+            license_ = (location.get("license") or "").lower()
+            abstract = (self._reconstruct_abstract(w.get("abstract_inverted_index"))
+                        if license_ in OPEN_LICENSES else "")
 
             works.append({
                 "title": w.get("title", ""),
@@ -156,6 +163,7 @@ class OpenAlexCollector(BaseCollector):
                 "venue": source.get("display_name", ""),
                 "is_open_access": (w.get("open_access") or {}).get("is_oa", False),
                 "abstract": abstract,
+                "license": license_ or None,
                 "concepts": [
                     c.get("display_name", "")
                     for c in (w.get("concepts") or [])[:5]

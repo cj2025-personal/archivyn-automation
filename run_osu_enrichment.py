@@ -2,7 +2,7 @@
 End-to-end OSU enrichment runner.
 
 Stages, in order:
-  1. collect_osu_scholar_urls.py  -> DDG -> osu_scholars/final/*.txt
+  1. collect_osu_scholar_urls.py  -> Brave Search API -> osu_scholars/final/*.txt
      (also writes the ``source`` field to each Mongo doc).
   2. run_legend_scholar_pipeline.py over the collected .txt files
      -> scrape -> license-aware chunk -> local chunked_profiles JSON.
@@ -146,7 +146,7 @@ def main() -> int:
 
     if not args.skip_collection:
         print("=" * 80)
-        print("[OSU] Stage 1: collect URLs via DuckDuckGo")
+        print("[OSU] Stage 1: collect URLs via the Brave Search API")
         print("=" * 80)
         rc = subprocess.call(_build_collect_cmd(args))
         if rc != 0:

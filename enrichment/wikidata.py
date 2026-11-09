@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .base_collector import BaseCollector, CollectorResult, ProfessorQuery
+from .crawl_policy import USER_AGENT
 from .validation import normalize
 
 SPARQL_URL = "https://query.wikidata.org/sparql"
@@ -31,14 +32,13 @@ class WikidataCollector(BaseCollector):
         # Wikimedia policy requires a User-Agent with a real contact.
         # Generic "Mozilla" UAs get 403'd. Override the parent's client with
         # a compliant one on first use.
-        import httpx, os
+        import httpx
         if self._client is None or self._client.is_closed:
-            email = os.getenv("OPENALEX_EMAIL") or os.getenv("UNPAYWALL_EMAIL") or "research@example.com"
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout),
                 follow_redirects=True,
                 headers={
-                    "User-Agent": f"OSU-scholar-enrichment/1.0 (research; {email})",
+                    "User-Agent": USER_AGENT,
                     "Accept": "application/json",
                 },
             )

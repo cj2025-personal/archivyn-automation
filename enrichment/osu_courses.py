@@ -1,27 +1,80 @@
 """
-OSU Course Catalog collector.
-Scrapes the public OSU class search to find courses taught by a professor.
-Uses content.osu.edu class search API.
+OSU course listings: which courses a professor teaches, from Ohio State's
+public class search (content.osu.edu/v2/classes/search).
+
+Two corrections from the 2026 run, where it found nobody (0 of 460):
+  - OSU term codes are four digits, "1" + two-digit year + season
+    (1262 Spring 2026, 1264 Summer 2026, 1268 Autumn 2026); the collector
+    sent "20268", which matches no term.
+  - Each result nests the course under `course`; the collector read subject
+    and title from the outer object.
+
+What is kept is what a course is - code, title, catalog description, term,
+credits, and the professor's role in it. Not when or where it meets: days,
+times, buildings and rooms say where a named person will be each week, which
+is no part of describing their teaching. Not instructors' emails either.
 """
 
 import logging
-import re
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Dict, List
 
 from .base_collector import BaseCollector, CollectorResult, ProfessorQuery
-from .validation import names_match_from_query, names_match_fuzzy
+from .validation import names_match_fuzzy, names_match_from_query
 
 logger = logging.getLogger(__name__)
 
-# OSU class search API
 CLASS_SEARCH_URL = "https://content.osu.edu/v2/classes/search"
+SEASONS = {"2": "Spring", "4": "Summer", "8": "Autumn"}
+
+
+def recent_terms(now: datetime = None, years: int = 3) -> List[str]:
+    """OSU term codes, newest first: this year and the two before it."""
+    year = (now or datetime.now()).year
+    return [f"1{y % 100:02d}{s}" for y in range(year, year - years, -1) for s in ("8", "4", "2")]
+
+
+def term_name(code: str) -> str:
+    if len(code) != 4 or not code.isdigit():
+        return code
+    return f"{SEASONS.get(code[3], '')} 20{code[1:3]}".strip()
+
+
+def teaching_role(query: ProfessorQuery, sections: List[Dict]) -> str:
+    """The professor's role in a course's sections ('' if they don't teach it)."""
+    for section in sections or []:
+        for meeting in section.get("meetings") or []:
+            for inst in meeting.get("instructors") or []:
+                name = inst.get("displayName") or ""
+                if names_match_from_query(query, name) or names_match_fuzzy(query.first_name, query.last_name, name):
+                    return inst.get("role") or "instructor"
+    return ""
+
+
+def course_record(query: ProfessorQuery, result: Dict, term: str) -> Dict:
+    """One search result as a course the professor teaches, or {} if they don't."""
+    course = result.get("course") or {}
+    role = teaching_role(query, result.get("sections") or [])
+    if not role or not course:
+        return {}
+    return {
+        "subject": course.get("subject", ""),
+        "catalog_number": course.get("catalogNumber", ""),
+        "title": course.get("title", ""),
+        "description": (course.get("description") or "")[:600],
+        "term": term,
+        "term_name": term_name(term),
+        "credit_hours": course.get("minUnits", ""),
+        "academic_career": course.get("academicCareer", ""),
+        "role": role,
+    }
 
 
 class OSUCoursesCollector(BaseCollector):
-    """Collect course information from OSU's class search."""
+    """Courses a professor teaches, from OSU's class search."""
 
     def __init__(self, **kwargs):
-        # OSU class search: multiple requests per professor (one per term)
+        # One request per term and query form; be gentle with the university.
         kwargs.setdefault("rate_limit_delay", 2.0)
         super().__init__(**kwargs)
 
@@ -30,156 +83,37 @@ class OSUCoursesCollector(BaseCollector):
         return "osu_courses"
 
     async def collect(self, query: ProfessorQuery) -> CollectorResult:
-        courses = await self._search_courses(query)
+        courses: List[Dict] = []
+        seen = set()
+        for term in recent_terms():
+            for q in (query.name, query.last_name):
+                if not q or len(q) < 2:
+                    continue
+                resp = await self._get_json(CLASS_SEARCH_URL, params={"q": q, "term": term, "campus": "col", "p": 1})
+                found = False
+                for result in ((resp or {}).get("data") or {}).get("courses") or []:
+                    record = course_record(query, result, term)
+                    if not record:
+                        continue
+                    found = True
+                    key = (record["subject"], record["catalog_number"], record["title"])
+                    if key not in seen:
+                        seen.add(key)
+                        courses.append(record)
+                if found:
+                    break  # the full name matched this term; no need for the broader query
         if not courses:
             return self._make_result(query, success=False, error="No courses found for this professor")
-
-        # Deduplicate by course code + title
-        seen = set()
-        unique_courses = []
-        for c in courses:
-            key = f"{c.get('subject', '')}{c.get('catalog_number', '')}:{c.get('title', '')}"
-            if key not in seen:
-                seen.add(key)
-                unique_courses.append(c)
-
-        data = {
-            "total_courses": len(unique_courses),
-            "courses": unique_courses,
-        }
-
-        raw_text = self._to_text(data, query)
-        return self._make_result(query, success=True, data=data, raw_text=raw_text)
-
-    async def _search_courses(self, query: ProfessorQuery) -> List[Dict]:
-        """Search OSU class search for courses by instructor name."""
-        all_courses = []
-
-        # Try current and recent terms
-        terms = self._get_recent_terms()
-
-        # Try multiple query formats: full name first, then "Last, First"
-        search_queries = [
-            query.name,
-            f"{query.last_name}, {query.first_name}",
-            query.last_name,
-        ]
-
-        found_any = False
-        for term in terms:
-            for search_q in search_queries:
-                if found_any and search_q == query.last_name:
-                    # Skip the broad last-name-only search if we already found results
-                    continue
-
-                params = {
-                    "q": search_q,
-                    "term": term,
-                    "campus": "col",  # Columbus campus
-                    "p": 1,
-                    "subject": "",
-                }
-
-                try:
-                    resp = await self._get_json(CLASS_SEARCH_URL, params=params)
-                    if not resp or not resp.get("data", {}).get("courses"):
-                        continue
-
-                    for course in resp["data"]["courses"]:
-                        # Check if this professor actually teaches it
-                        sections = course.get("sections", [])
-                        prof_teaches = False
-                        section_info = []
-
-                        for section in sections:
-                            for meeting in section.get("meetings", []):
-                                instructors = meeting.get("instructors", [])
-                                for inst in instructors:
-                                    inst_name = inst.get("displayName", "")
-                                    # Try strict match first, then fuzzy
-                                    matched = names_match_from_query(query, inst_name)
-                                    if not matched:
-                                        matched = names_match_fuzzy(
-                                            query.first_name, query.last_name, inst_name
-                                        )
-                                    if matched:
-                                        prof_teaches = True
-                                        section_info.append({
-                                            "section": section.get("section", ""),
-                                            "class_number": section.get("classNumber", ""),
-                                            "component": section.get("component", ""),
-                                            "days": meeting.get("days", ""),
-                                            "start_time": meeting.get("startTime", ""),
-                                            "end_time": meeting.get("endTime", ""),
-                                            "building": meeting.get("buildingDescription", ""),
-                                            "room": meeting.get("room", ""),
-                                            "instructor": inst.get("displayName", ""),
-                                        })
-
-                        if prof_teaches:
-                            all_courses.append({
-                                "subject": course.get("subject", ""),
-                                "catalog_number": course.get("catalogNumber", ""),
-                                "title": course.get("title", ""),
-                                "description": course.get("description", ""),
-                                "term": term,
-                                "term_name": self._term_name(term),
-                                "credit_hours": course.get("minUnits", ""),
-                                "academic_career": course.get("academicCareer", ""),
-                                "sections": section_info,
-                            })
-                            found_any = True
-
-                except Exception as e:
-                    logger.warning("[osu_courses] Error searching term %s with query '%s': %s", term, search_q, e)
-                    continue
-
-                # If we found results with this query format, skip broader queries for this term
-                if found_any:
-                    break
-
-        return all_courses
-
-    @staticmethod
-    def _get_recent_terms() -> List[str]:
-        """Generate term codes for recent semesters.
-        OSU term format: YYYYT where T is: 2=Spring, 4=Summer, 8=Autumn
-        """
-        from datetime import datetime
-        year = datetime.now().year
-        terms = []
-        for y in range(year, year - 3, -1):
-            terms.extend([f"{y}8", f"{y}2", f"{y}4"])  # Autumn, Spring, Summer
-        return terms
-
-    @staticmethod
-    def _term_name(term_code: str) -> str:
-        """Convert term code to readable name."""
-        if len(term_code) != 5:
-            return term_code
-        year = term_code[:4]
-        season = {"2": "Spring", "4": "Summer", "8": "Autumn"}.get(term_code[4], "")
-        return f"{season} {year}"
+        data = {"total_courses": len(courses), "courses": courses}
+        return self._make_result(query, success=True, data=data, raw_text=self._to_text(data, query))
 
     def _to_text(self, data: Dict, query: ProfessorQuery) -> str:
-        lines = []
-        lines.append(f"=== OSU Courses Taught: {query.name} ===")
-        lines.append(f"Total unique courses found: {data['total_courses']}")
-        lines.append("")
-
+        lines = [f"=== OSU Courses Taught: {query.name} ===", f"Total unique courses found: {data['total_courses']}", ""]
         for i, course in enumerate(data["courses"], 1):
-            code = f"{course['subject']} {course['catalog_number']}"
-            lines.append(f"\n{i}. {code}: {course['title']}")
-            lines.append(f"   Term: {course.get('term_name', course.get('term', 'N/A'))}")
+            lines.append(f"\n{i}. {course['subject']} {course['catalog_number']}: {course['title']}")
+            lines.append(f"   Term: {course.get('term_name') or course.get('term')}")
             if course.get("credit_hours"):
                 lines.append(f"   Credit hours: {course['credit_hours']}")
             if course.get("description"):
                 lines.append(f"   Description: {course['description'][:400]}")
-            if course.get("sections"):
-                for sec in course["sections"][:3]:
-                    time_str = ""
-                    if sec.get("days") and sec.get("start_time"):
-                        time_str = f" ({sec['days']} {sec['start_time']}-{sec['end_time']})"
-                    lines.append(f"   Section: {sec.get('component', '')} {sec.get('section', '')}{time_str}")
-
         return "\n".join(lines)

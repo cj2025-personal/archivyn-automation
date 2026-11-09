@@ -9,9 +9,13 @@ from urllib.parse import urlparse, urlunparse
 from urllib import robotparser
 import urllib.request
 
+from enrichment.crawl_policy import USER_AGENT
+
 
 class RobotsCache:
-    def __init__(self, user_agent: str = "*", timeout: int = 10, ttl_seconds: int = 3600) -> None:
+    # New code uses enrichment.crawl_policy.robots_allows; this keeps our real
+    # name on the robots.txt request (never "*") for anything still using it.
+    def __init__(self, user_agent: str = USER_AGENT, timeout: int = 10, ttl_seconds: int = 3600) -> None:
         self.user_agent = user_agent
         self.timeout = timeout
         self.ttl_seconds = ttl_seconds

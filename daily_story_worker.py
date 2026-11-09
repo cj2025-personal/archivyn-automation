@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover
     BeautifulSoup = None  # type: ignore
 
 from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
+from enrichment.crawl_policy import SYNC_ROBOTS, USER_AGENT, is_challenge_page
 import legend_identity
 
 try:
@@ -265,13 +266,13 @@ TREND_RELEVANCE_SCHEMA: Dict[str, Any] = {
 
 # The news article a story is written on, not only its feed entry. The writer
 # had the RSS title and a line of summary, too thin to give concrete details
-# without inventing them. The selected item's page is fetched politely (an
-# identifying User-Agent, short timeouts, http(s) only, few redirects, a size
-# cap), its main text extracted and kept on the story as
+# without inventing them. The selected item's page is fetched politely (our
+# one identifying User-Agent, only where robots.txt allows - each redirect
+# included - short timeouts, http(s) only, few redirects, a size cap, a bot
+# check taken as a refusal), its main text extracted and kept on the story as
 # trend_issue.selected.article_text, and given to the writer as the grounding
 # for claims about the event. Any failure falls back to title and summary,
 # with the reason in trend_issue.selected.article_fetch.
-ARTICLE_USER_AGENT = "ArchivynStoryReader/1.0 (reads the one news article each daily legend story is written on)"
 ARTICLE_CONNECT_TIMEOUT_SECONDS = 5
 ARTICLE_READ_TIMEOUT_SECONDS = 10
 ARTICLE_TOTAL_SECONDS = 25
@@ -643,6 +644,8 @@ class DailyStoryWorker:
         # The HTTP client for news article pages (a requests.Session, made on
         # first use); see _fetch_article_text.
         self.article_http: Any = None
+        # What robots.txt allows us on a publisher's site (feeds and articles).
+        self.article_robots: Any = SYNC_ROBOTS
         self.style_sentence_samples = int(safe_text(os.getenv("STORY_STYLE_SENTENCE_SAMPLES")) or 120)
         env_enforce_quality = (
             safe_text(os.getenv("STORY_ENFORCE_PROFILE_QUALITY")).lower() in {"1", "true", "yes", "on"}
@@ -1940,7 +1943,7 @@ class DailyStoryWorker:
 
     @staticmethod
     def _http_get_text(url: str, timeout_seconds: int, headers: Optional[Dict[str, str]] = None) -> str:
-        req_headers = {"User-Agent": "Mozilla/5.0 (DailyStoryWorker)"}
+        req_headers = {"User-Agent": USER_AGENT}
         if headers:
             req_headers.update(headers)
         req = Request(url, headers=req_headers)
@@ -2008,9 +2011,11 @@ class DailyStoryWorker:
                 raise ArticleFetchError("refused_host", safe_text(parts.hostname))
             if excluded_publisher(current):
                 raise ArticleFetchError("not_permitted", f"{safe_text(parts.hostname)}: the publisher's terms do not allow this use")
+            if not self.article_robots.allows(current):
+                raise ArticleFetchError("robots_disallowed", f"{safe_text(parts.hostname)}: robots.txt does not allow this page")
             response = self.article_http.get(
                 current,
-                headers={"User-Agent": ARTICLE_USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+                headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
                 timeout=(ARTICLE_CONNECT_TIMEOUT_SECONDS, ARTICLE_READ_TIMEOUT_SECONDS),
                 stream=True,
                 allow_redirects=False,
@@ -2038,6 +2043,9 @@ class DailyStoryWorker:
                         raise ArticleFetchError("too_large", f"over {ARTICLE_MAX_BYTES} bytes")
                     if time.monotonic() - started > ARTICLE_TOTAL_SECONDS:
                         raise ArticleFetchError("timeout", f"over {ARTICLE_TOTAL_SECONDS}s in all")
+                if is_challenge_page(bytes(body[:8000]).decode("utf-8", errors="replace")):
+                    # A bot check is the site's answer, not a page to get past.
+                    raise ArticleFetchError("bot_check", f"{safe_text(parts.hostname)} answered with a bot check")
                 return bytes(body), content_type, current
             finally:
                 response.close()
@@ -2220,6 +2228,10 @@ class DailyStoryWorker:
     def _fetch_trends_rss(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for feed_url in self.trend_rss_urls:
+            # A feed is a page on the publisher's site: read only where robots.txt allows
+            # (skipped like a feed that fails to load; stdout carries only the run's JSON).
+            if not self.article_robots.allows(feed_url):
+                continue
             xml_text = self._http_get_text(feed_url, timeout_seconds=self.trend_timeout_seconds)
             if not xml_text:
                 continue
