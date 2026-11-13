@@ -12,7 +12,16 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-import pytest
+try:
+    import pytest
+except ImportError:
+    # The editorial job image checks the pipeline with unittest and has no
+    # pytest, and these tests are pytest's (fixtures, monkeypatch, parametrize).
+    # Skipped there rather than failing to import, which stopped the admin
+    # release from deploying its jobs (2026-11-13). Run them with pytest.
+    import unittest
+
+    raise unittest.SkipTest("pytest-style tests: run them with pytest")
 
 from enrichment import base_collector, crawl_policy, orchestrator
 from enrichment.base_collector import BaseCollector, ProfessorQuery
