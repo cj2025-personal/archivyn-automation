@@ -214,6 +214,65 @@ def test_a_bot_check_page_is_a_refusal_not_content(worker, monkeypatch):
     assert w.playwright_calls == []
 
 
+# 2026-11-13: the grade 3-5 append run fetched four legends' pages, Booker T.
+# Washington's own Wikipedia article among them, and got nothing from any:
+# the worker read a refusal phrase anywhere in a page's HTML as a bot check,
+# scripts included, and refused it without a log line.
+ARTICLE = (
+    "<html><head><title>Booker T. Washington - Wikipedia</title>"
+    '<script>RLCONF={"wgConfirmEditCaptchaNeededForGenericEdit":"hcaptcha","wgCaptchaSiteKey":"x"};</script>'
+    '<script src="https://www.google.com/recaptcha/api.js"></script></head><body><main>'
+    "<h1>Booker T. Washington</h1>"
+    + "<p>Booker T. Washington was an American educator who led Tuskegee Institute and wrote Up from Slavery.</p>" * 30
+    + "<p>Black students met access denied at many colleges, and he raised money for schools across the South.</p>"
+    + '<form><label>CAPTCHA</label><div class="g-recaptcha" data-sitekey="x"></div></form>'
+    "</main></body></html>"
+)
+
+
+def test_a_page_whose_scripts_form_or_words_carry_a_refusal_phrase_is_read(worker, monkeypatch):
+    pw, w = worker
+    requested = _serve(pw, monkeypatch, lambda req: _Page(ARTICLE, req.full_url))
+    assert not pw.is_refusal_text(ARTICLE)
+    assert not w.is_blocked_or_placeholder_text(ARTICLE)
+    result = w.run("https://en.wikipedia.org/wiki/Booker_T._Washington")
+    assert result["status"] == "success", result
+    assert "led Tuskegee Institute" in result["profile_page"]["content"]
+    assert requested == ["https://en.wikipedia.org/wiki/Booker_T._Washington"]
+    assert w.playwright_calls == [], "a page that was read is not tried again in a browser"
+
+
+@pytest.mark.parametrize("notice", [
+    "<html><head><title>Access Denied</title></head><body><h1>Access Denied</h1>You don't have permission to access this page. Reference #18.6f2</body></html>",
+    "<html><body>Request unsuccessful. Incapsula incident ID: 887000140028861-4501</body></html>",
+    "<html><head><title>u.edu</title><script>var a=1;</script></head><body><p>Please complete the security check to continue.</p><div class='h-captcha'></div></body></html>",
+])
+def test_a_block_notice_is_still_a_refusal_and_never_retried(worker, monkeypatch, notice):
+    pw, w = worker
+    _serve(pw, monkeypatch, lambda req: _Page(notice, req.full_url))
+    result = w.run("https://u.edu/people/volek")
+    assert result.get("refused"), result
+    assert w.playwright_calls == []
+
+
+def test_a_script_shell_still_goes_to_the_browser():
+    import playwright_subprocess_worker as pw
+
+    shell = "<html><head><script>window.app={}</script></head><body><noscript>Please enable JavaScript to continue using this application.</noscript><div id=root></div></body></html>"
+    assert pw.ScraperWorker.is_blocked_or_placeholder_text(shell)
+    assert not pw.is_refusal_text(shell)
+
+
+def test_block_notices_are_read_from_the_title_or_a_short_page_only():
+    phrases = ("captcha", "access denied")
+    assert crawl_policy.is_block_notice("<title>Access Denied</title>" + "<p>menu</p>" * 900, phrases)
+    assert crawl_policy.is_block_notice("Access denied. Reference #18.6f2", phrases)
+    assert not crawl_policy.is_block_notice("Their access denied, they built their own schools. " * 60, phrases)
+    # A read cut off inside a script leaves the script out, not in.
+    assert not crawl_policy.is_block_notice('<html><head><script>var cfg={"captcha":', phrases)
+    assert crawl_policy.visible_text("<p>a &amp; b</p><style>p{}</style><!-- captcha -->") == "a & b"
+
+
 def test_a_redirect_is_followed_only_where_robots_txt_allows(worker, monkeypatch):
     pw, _ = worker
     handler = pw._PolicyRedirectHandler()

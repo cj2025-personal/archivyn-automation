@@ -43,7 +43,7 @@ from api.utils.source_guardrails import (
     infer_license_for_url,
     is_noise_domain,
 )
-from enrichment.crawl_policy import USER_AGENT, robots_allows
+from enrichment.crawl_policy import USER_AGENT, is_block_notice, robots_allows
 from api.utils.claim_extractor import extract_claims
 from profile_chunking_pipeline import ProfileChunkingPipeline
 
@@ -1134,9 +1134,13 @@ class UnifiedPipeline:
         return any(t in text_lc for t in paywall_terms)
 
     def _is_anti_bot_content(self, text: str) -> bool:
+        """A source whose text is a block or bot-check notice (it is then
+        recorded as blocked and left out). Read as crawl_policy.is_block_notice
+        reads a page: a notice is short, while an article that says "access
+        denied" or "Cloudflare", or a page whose form is labeled CAPTCHA, is
+        content."""
         if not text:
             return False
-        t = text.lower()
         patterns = [
             "access to this page has been denied",
             "verify you are human",
@@ -1155,7 +1159,7 @@ class UnifiedPipeline:
             "not a bot",
             "making sure you're not a bot",
         ]
-        return any(p in t for p in patterns)
+        return is_block_notice(text, patterns)
 
     @staticmethod
     def _extract_domain_from_url(url: str) -> str:

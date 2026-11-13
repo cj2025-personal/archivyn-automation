@@ -18,12 +18,14 @@ by their own terms and are not "crawled"; robots.txt is for page fetches.
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
+import re
 import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Awaitable, Callable, Dict, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -63,6 +65,47 @@ def is_challenge_page(html: str) -> bool:
         return False
     low = html[:8000].lower()
     return any(sig in low for sig in _CHALLENGE_SIGNATURES)
+
+
+#: A block or bot-check notice says little besides itself. Its phrases
+#: ("access denied", "captcha", "security check"...) count only in a page's
+#: title, or in the visible text of a page with no more than this much of it:
+#: never in scripts, and never across a whole page, where a contact form's
+#: reCAPTCHA, a site's hCaptcha settings or an article's own words would turn
+#: content into a refusal. The page worker read every page that way until
+#: 2026-11-13; the grade 3-5 append run then lost every Wikipedia article and
+#: most other pages, each as a silent "bot check".
+BLOCK_NOTICE_MAX_VISIBLE_CHARS = 1500
+
+# A script, style or comment cut off by a truncated read runs to the end.
+_INVISIBLE = re.compile(r"<(script|style|template)\b[^>]*>.*?(?:</\1\s*>|$)|<!--.*?(?:-->|$)", re.I | re.S)
+_TAG = re.compile(r"<[^>]*>")
+_TITLE = re.compile(r"<title\b[^>]*>(.*?)</title\s*>", re.I | re.S)
+
+
+def visible_text(html: str) -> str:
+    """A page's text as a reader sees it: no scripts, styles, comments or tags."""
+    text = _TAG.sub(" ", _INVISIBLE.sub(" ", html or ""))
+    return " ".join(html_lib.unescape(text).split())
+
+
+def page_title(html: str) -> str:
+    found = _TITLE.search(html or "")
+    return " ".join(html_lib.unescape(found.group(1)).split()) if found else ""
+
+
+def is_block_notice(text: str, phrases: Iterable[str]) -> bool:
+    """True when text (a page's HTML, or the text taken from one) is a block
+    or bot-check notice by these phrases: one is in its title, or in its
+    visible text when that is short enough to be the notice alone."""
+    if not text:
+        return False
+    wanted = tuple(p.lower() for p in phrases)
+    title = page_title(text).lower()
+    if title and any(p in title for p in wanted):
+        return True
+    visible = visible_text(text)
+    return len(visible) <= BLOCK_NOTICE_MAX_VISIBLE_CHARS and any(p in visible.lower() for p in wanted)
 
 
 def parser_for(status: Optional[int], body: str) -> Tuple[RobotFileParser, bool]:

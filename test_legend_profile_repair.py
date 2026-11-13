@@ -13,6 +13,7 @@ Run with:  python -m unittest test_legend_profile_repair
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import copy
 import io
@@ -413,6 +414,38 @@ class ModelPathTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {"PROFILE_ROLE_FILTER_ENABLED": "1", "PROFILE_ROLE_FILTER_USE_LLM": "1", "OPENAI_API_KEY": "sk-test-not-used"}):
             with self.assertRaisesRegex(RuntimeError, "page role filter"):
                 repair.make_pipeline(Path(tmp) / "out")
+
+
+@needs_scraping_stack
+class BlockNoticeTests(unittest.TestCase):
+    """2026-11-13: pages were lost as "bot checks" for a phrase anywhere in
+    them. The pipeline's own check on a page's text reads the same way as the
+    page worker's now: a notice is short; an article is content."""
+
+    def test_an_article_that_says_access_denied_is_kept_and_a_notice_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = repair.make_pipeline(Path(tmp) / "out")
+        article = page_text(0, 30) + " Black students met access denied at colleges; the site now sits behind Cloudflare."
+        self.assertFalse(pipeline._is_anti_bot_content(article))
+        self.assertTrue(pipeline._is_anti_bot_content("Access denied. You don't have permission to access this page. Reference #18.6f2"))
+
+    def test_a_page_whose_words_carry_the_phrases_gives_passages(self) -> None:
+        class Saying(Scraper):
+            async def extract_all(inner, url: str) -> Dict[str, Any]:
+                found = await Scraper.extract_all(inner, url)
+                for record in found.get("source_records") or []:
+                    # A line of its own, as a page's paragraphs arrive.
+                    record["content"] += "\nAccess denied to Black students, she said, shaped every school she built.\n"
+                return found
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = repair.make_pipeline(Path(tmp) / "out", Saying())
+            result = asyncio.run(pipeline.process_profile_from_urls(urls=[NASA], profile_name=NAME, profile_id=PID))
+        self.assertEqual(result["status"], "success", result)
+        summary = result["intent_summary"]
+        # Blocked, the page would leave only the pipeline's one-passage stand-in.
+        self.assertFalse(summary.get("fallback_chunk_used"), summary)
+        self.assertGreaterEqual(summary.get("accepted_chunk_count", 0), 3, summary)
 
 
 # ── Against the local test database ─────────────────────────────────────────

@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from bs4 import BeautifulSoup, Tag
 
-from enrichment.crawl_policy import USER_AGENT, SyncRobotsPolicy, fetch_robots_txt, is_challenge_page
+from enrichment.crawl_policy import USER_AGENT, SyncRobotsPolicy, fetch_robots_txt, is_block_notice, is_challenge_page
 
 HEADERS = {
     # Our own name on every request, so a site can tell who we are and ask us to stop.
@@ -63,7 +63,9 @@ TERMS_FORBID_AUTOMATED_ACCESS = (
 REFUSAL_STATUSES = (401, 403, 429)
 
 # Bot checks and block pages are refusals too (crawl_policy.is_challenge_page
-# catches the common ones; these are the ones this worker has met).
+# catches the common ones; these are the ones this worker has met). They mark
+# a refusal only as crawl_policy.is_block_notice reads them: in the title, or
+# in a page that is the notice alone.
 REFUSAL_TEXT_PATTERNS = (
     "request unsuccessful",
     "incapsula incident id",
@@ -152,13 +154,14 @@ def not_fetchable(url: str) -> Optional[str]:
 
 
 def is_refusal_text(text: str) -> bool:
-    """A bot-check or block page served in place of the content."""
+    """A bot-check or block page served in place of the content. A full page
+    that only mentions one of the phrases (its contact form's reCAPTCHA, its
+    site's hCaptcha settings, an article saying "access denied") is content."""
     if not text:
         return False
     if is_challenge_page(text):
         return True
-    sample = text.lower()
-    return any(pattern in sample for pattern in REFUSAL_TEXT_PATTERNS)
+    return is_block_notice(text, REFUSAL_TEXT_PATTERNS)
 
 
 def refusal_meta(reason: str, *, fetcher: str, start: float, status_code: Optional[int] = None) -> Dict:
@@ -220,10 +223,10 @@ class ScraperWorker:
 
     @staticmethod
     def is_blocked_or_placeholder_text(text: str) -> bool:
-        sample = (text or "").strip().lower()
-        if not sample:
-            return False
-        return any(pattern in sample for pattern in BLOCKED_TEXT_PATTERNS)
+        """A block notice, or a script shell with nothing to read yet (the
+        browser is tried for those), by crawl_policy.is_block_notice: a full
+        page whose scripts or words carry one of the phrases is read as is."""
+        return is_block_notice(text, BLOCKED_TEXT_PATTERNS)
 
     def pace(self, url: str) -> bool:
         """Wait out the Crawl-delay robots.txt asks between our requests to a
@@ -358,6 +361,9 @@ class ScraperWorker:
 
             if is_refusal_text(text):
                 # A bot check is the site's answer, not a page to get past.
+                # Said in the log: this refusal used to leave none, and a page
+                # lost to it looked like a fetch that never happened.
+                log(f"Bot check or block page for {url} - refused; not retried")
                 meta["error"] = "bot_check_page"
                 meta["refused"] = True
                 return "error", None, final_url, None, meta
