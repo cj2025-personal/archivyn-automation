@@ -214,6 +214,18 @@ class SourceLicenceTests(unittest.TestCase):
         self.assertEqual(unknown["host"], "library.example.edu")
         self.assertEqual(source_licences.licence_for("https://fakewikipedia.org.evil.com/x")["status"], source_licences.UNKNOWN)
 
+    def test_only_a_page_fit_to_credit_is_cited(self) -> None:
+        credit = worker_module.creditable_source
+        self.assertTrue(credit("https://en.wikipedia.org/wiki/X"))
+        self.assertTrue(credit("https://library.example.edu/x"))
+        for url in ("https://www.reddit.com/r/x", "https://www.aljazeera.com/a", "https://www.researchgate.net/p", "", "not a link"):
+            self.assertFalse(credit(url), url)
+        doc = legend_doc(pages=[PAGES[0], "https://www.reddit.com/r/history/jemison"])
+        kept = worker_module.DailyStoryWorker._with_creditable_passages(doc)
+        links = [c["source_url"] for chunks in kept["rag_context"]["section_chunks"].values() for c in chunks]
+        self.assertTrue(links)
+        self.assertTrue(all("reddit" not in link for link in links), "a forum's passage is never cited")
+
 
 class EvergreenTemplateTests(unittest.TestCase):
     def setUp(self) -> None:

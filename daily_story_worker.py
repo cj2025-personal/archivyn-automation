@@ -539,6 +539,27 @@ def first_person_plural(text: Any) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def creditable_source(url: Any) -> bool:
+    """Whether a page may be cited, and credited, in an evergreen story or a
+    child bio: a web link, not a publisher whose terms forbid this use
+    (EXCLUDED_PUBLISHER_DOMAINS), not a site on the source blocklist (social
+    media, forums, known low-value sites) and not a paper-sharing site, as
+    the news writer's source filter rules them (_score_source_domain)."""
+    text = safe_text(url)
+    if "://" not in text:
+        return False
+    try:
+        host = (urlparse(text).hostname or "").lower()
+    except ValueError:
+        return False
+    host = host[4:] if host.startswith("www.") else host
+    if not host or excluded_publisher(text):
+        return False
+    if host in SOURCE_DOMAIN_BLOCKLIST or any(host.endswith(f".{bad}") for bad in SOURCE_DOMAIN_BLOCKLIST):
+        return False
+    return not any(site in host for site in ("researchgate.net", "academia.edu"))
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -6264,9 +6285,10 @@ Return only JSON.
     @staticmethod
     def _with_creditable_passages(scholar_doc: Dict[str, Any]) -> Dict[str, Any]:
         """A copy of a (restricted) legend holding only the passages an
-        evergreen story may cite: those with a page to credit them to. A
-        passage with no link could not be attributed. Text built from all
-        pages together (section_text) is dropped too, for the same reason."""
+        evergreen story may cite: those whose page may be credited
+        (creditable_source). A passage with no link could not be attributed.
+        Text built from all pages together (section_text) is dropped too, for
+        the same reason."""
         out = dict(scholar_doc)
         rag_context = dict(scholar_doc.get("rag_context") or {})
         sections = rag_context.get("section_chunks") or {}
@@ -6275,7 +6297,10 @@ Return only JSON.
             for section, chunks in sections.items():
                 if not isinstance(chunks, list):
                     continue
-                with_links = [c for c in chunks if isinstance(c, dict) and legend_identity.chunk_links(c)]
+                with_links = [
+                    c for c in chunks
+                    if isinstance(c, dict) and legend_identity.chunk_links(c) and creditable_source(legend_identity.chunk_links(c)[0])
+                ]
                 if with_links:
                     kept[section] = with_links
         rag_context["section_chunks"] = kept
@@ -6292,7 +6317,7 @@ Return only JSON.
         for chunk in context_chunks:
             for url in legend_identity.chunk_links(chunk):
                 key = legend_identity.page_key(url)
-                if key in seen or excluded_publisher(url) or not self._is_valid_external_url(url):
+                if key in seen or not creditable_source(url) or not self._is_valid_external_url(url):
                     continue
                 seen.add(key)
                 urls.append(self._clean_url_candidate(url))

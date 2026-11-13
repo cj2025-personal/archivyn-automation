@@ -56,7 +56,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import daily_story_personalize as personalize
 import legend_identity
 import model_costs
-from daily_story_worker import SECTION_PRIORITY, DailyStoryWorker, safe_text, utc_now_iso
+from daily_story_worker import SECTION_PRIORITY, DailyStoryWorker, creditable_source, safe_text, utc_now_iso
 from legend_evergreen import parse_ids
 
 URI_ENV = "LEGEND_MONGO_URI"
@@ -147,8 +147,9 @@ def reading_check(text: str) -> Dict[str, Any]:
 
 def bio_passages(doc: Dict[str, Any]) -> List[Dict[str, str]]:
     """The legend's reviewed passages a bio may use, life before works:
-    passages of pages its identity review ruled about the legend, with a
-    page to credit, the biographical sections first, longer ones first."""
+    passages of pages its identity review ruled about the legend, whose page
+    may be credited (creditable_source), the biographical sections first,
+    longer ones first."""
     restricted = legend_identity.restricted_to_reviewed_sources(doc)
     sections = (restricted.get("rag_context") or {}).get("section_chunks") or {}
     found: List[Tuple[int, int, str, Dict[str, Any]]] = []
@@ -156,7 +157,7 @@ def bio_passages(doc: Dict[str, Any]) -> List[Dict[str, str]]:
         for chunk in chunks:
             text = legend_identity.chunk_text(chunk)
             links = legend_identity.chunk_links(chunk)
-            if len(text) < legend_identity.MIN_PASSAGE_CHARS or not links:
+            if len(text) < legend_identity.MIN_PASSAGE_CHARS or not links or not creditable_source(links[0]):
                 continue
             found.append((SECTION_PRIORITY.get(safe_text(section).lower(), 99), -len(text), safe_text(section), {**chunk, "_url": links[0]}))
     found.sort(key=lambda row: (row[0], row[1]))

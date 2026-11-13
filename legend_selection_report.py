@@ -50,6 +50,7 @@ from typing import Any, Dict, List, Optional
 
 import legend_identity
 from daily_story_personalize import readability_metrics
+from daily_story_worker import creditable_source
 from legend_child_bio import BIO_BAND, learner_api_fk_grade
 from readonly_mongo import connect_read_only
 from source_licences import OPEN, REFUSED, licence_for
@@ -111,8 +112,9 @@ def source_signals(doc: Dict[str, Any]) -> Dict[str, Any]:
             passages += 1
             chars += len(text)
             links = legend_identity.chunk_links(chunk)
-            if not links:
-                by_licence["no_link"] += 1
+            if not links or not creditable_source(links[0]):
+                # Nothing the writer may cite and credit (daily_story_worker.creditable_source).
+                by_licence["no_link" if not links else "not_creditable"] += 1
                 continue
             creditable += 1
             key = legend_identity.chunk_page_key(chunk)
