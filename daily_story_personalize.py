@@ -15,7 +15,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from daily_story_worker import DailyStoryWorker, parse_date, safe_text, utc_now_iso
+from daily_story_worker import STORY_MODE_EVERGREEN, DailyStoryWorker, parse_date, safe_text, utc_now_iso
 
 
 AUDIENCE_CONTRACT_VERSION = "active-student-audience-v1"
@@ -619,10 +619,34 @@ TOPIC_VERDICT_SCHEMA: Dict[str, Any] = {
 }
 
 
+def is_evergreen(story: Dict[str, Any]) -> bool:
+    """Whether the story is an evergreen one: about the legend's own life and
+    work, with no news item (daily_story_worker STORY_MODE_EVERGREEN)."""
+    return safe_text(story.get("story_mode")) == STORY_MODE_EVERGREEN
+
+
 def topic_prompt(story: Dict[str, Any], band_key: str) -> str:
     band = GRADE_BANDS[band_key]
     content = story.get("content") or {}
     trend = story.get("trend_issue") or {}
+    if is_evergreen(story):
+        # No headline to rule on: the story's subject is the legend's life
+        # and work, so the judge reads more of the story itself.
+        return f"""You decide whether a story may be brought to {band['label']} readers (typically
+ages {band['typical_age_min']} to {band['typical_age_max']}) on a children's reading platform. The story is about the
+life and work of a historical scholar, written from published sources about them; it is not about the news.
+
+Rules for this band:
+{TOPIC_SUITABILITY_RULES[band_key]}
+
+Decide on what the story is about and what a reader would have to engage with, not on the writing.
+A story can be gentle and still be about something this band should not be given.
+Return JSON only: suitable (true or false) and reason (one sentence a reviewer can read).
+
+Story title: {safe_text(content.get('title'))}
+Standfirst: {safe_text(content.get('standfirst'))}
+Story: {_strip_markup(content.get('article_markdown'))[:4000]}
+"""
     opening = _strip_markup(content.get("article_markdown"))[:1500]
     return f"""You decide whether a news topic may be brought to {band['label']} readers (typically
 ages {band['typical_age_min']} to {band['typical_age_max']}) on a children's reading platform, as the subject of
@@ -693,7 +717,15 @@ def not_suitable_variant(story: Dict[str, Any], band_key: str, verdict: Dict[str
     }
 
 
-def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_llm: bool, scholar_id: str = "") -> Dict[str, Any]:
+def run_personalization(
+    *,
+    story_date: str,
+    max_stories: int,
+    dry_run: bool,
+    no_llm: bool,
+    scholar_id: str = "",
+    story_mode: str = "",
+) -> Dict[str, Any]:
     worker = DailyStoryWorker(use_llm=not (dry_run or no_llm), trends_enabled=False)
     try:
         audience = resolve_active_audience(worker)
@@ -701,6 +733,16 @@ def run_personalization(*, story_date: str, max_stories: int, dry_run: bool, no_
             "story_date": story_date,
             "status": {"$in": ["pending_review", "generated"]},
         }
+        if safe_text(story_mode) == STORY_MODE_EVERGREEN:
+            # Evergreen stories written for a chosen list of legends
+            # (legend_evergreen) can be written over several days, a run
+            # resumed: their versions are made whatever day they were written,
+            # for those whose bands are not all settled (written or ruled out).
+            story_filter = {
+                "story_mode": STORY_MODE_EVERGREEN,
+                "status": {"$in": ["pending_review", "generated"]},
+                "personalization.ready": {"$ne": True},
+            }
         if safe_text(scholar_id):
             story_filter["scholar.profile_id"] = safe_text(scholar_id)
         stories = list(
@@ -1022,6 +1064,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--date", type=str, default=None)
     parser.add_argument("--max-stories", type=int, default=25)
     parser.add_argument("--scholar-id", type=str, default="", help="Optional profile_id for bounded recovery")
+    parser.add_argument(
+        "--story-mode",
+        type=str,
+        default="",
+        choices=["", STORY_MODE_EVERGREEN],
+        help="evergreen: every evergreen story whose versions are not yet settled, whatever its date (--date is then not used)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-llm", action="store_true")
     return parser
@@ -1035,6 +1084,7 @@ def main() -> int:
         dry_run=args.dry_run,
         no_llm=args.no_llm,
         scholar_id=args.scholar_id,
+        story_mode=args.story_mode,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 1 if result.get("status") == "completed_with_failures" else 0

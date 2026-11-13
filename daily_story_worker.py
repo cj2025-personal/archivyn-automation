@@ -47,6 +47,8 @@ except ImportError:  # pragma: no cover
 from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
 from enrichment.crawl_policy import SYNC_ROBOTS, USER_AGENT, is_challenge_page
 import legend_identity
+from readonly_mongo import ReadOnlyDatabase
+from source_licences import LICENCE_POLICY_VERSION, OPEN, REFUSED, licence_for
 
 try:
     from pymongo.errors import DuplicateKeyError
@@ -431,6 +433,53 @@ DEFAULT_STANDARD_SECTION_BLUEPRINT = [
     "Conclusion",
 ]
 
+# What a story is written from. A news story looks at one current event
+# through a legend's documented ideas. An evergreen story is about the
+# legend's own life and work, written from the legend's reviewed sources
+# alone, with no news item: so it cannot rest on a publisher whose terms
+# forbid this use (the 23 stories on legal hold since 2026-11-01 all did), and
+# it reads the same next year. Until 2026-11-12 a story written with no news
+# item was the news article's template filled without its event and counted
+# as degraded_no_trend_data; it is now an evergreen story, with its own
+# template, checks and record of sources, through the same review, grade-band
+# versions and age screen as any other.
+STORY_MODE_NEWS = "news"
+STORY_MODE_EVERGREEN = "evergreen"
+STORY_MODES = (STORY_MODE_NEWS, STORY_MODE_EVERGREEN)
+EVERGREEN_POLICY_VERSION = "legend-evergreen-v1"
+
+# The evergreen story's sections: who the legend was, what they worked on,
+# one idea a young reader can hold on to, why it mattered (pilot plan B1).
+# No section looks at the news: the closing news-facing sections ("Why This
+# Matters Now", "What to Watch Next") are where every draft of 2026-11-01
+# failed its citation checks.
+EVERGREEN_SECTION_BLUEPRINT = [
+    "Who They Were",
+    "What They Worked On",
+    "One Idea to Hold On To",
+    "Why It Mattered",
+    "Looking Back",
+]
+# Each heading the structure check looks for, by what the section is for.
+EVERGREEN_HEADING_GROUPS: Dict[str, List[str]] = {
+    "who": [r"\bwho\b", r"\blife\b", r"\bearly years\b"],
+    "work": [r"\bwork(?:ed|s)?\b", r"\bresearch\b", r"\bquestions?\b"],
+    "idea": [r"\bidea\b", r"\bhold on\b"],
+    "mattered": [r"\bmattered\b", r"\bmatters\b", r"\blegacy\b", r"\bimpact\b"],
+    "closing": [r"\blooking back\b", r"\bconclusion\b", r"\bclosing\b"],
+}
+# Shorter than a news commentary (1,000 to 1,500 words, 7 sections): a life
+# and one idea, told plainly, is what the grade-band versions are made from.
+EVERGREEN_MIN_ARTICLE_WORDS = 700
+EVERGREEN_MAX_ARTICLE_WORDS = 1100
+EVERGREEN_MIN_SECTION_WORDS = 100
+# How the topic miners word a topic for a news commentary; an evergreen
+# story's focus is the topic alone.
+EVERGREEN_NEWS_TOPIC_FRAME = re.compile(r"^what history suggests about (.+?) today$", flags=re.I)
+# Story keys of evergreen stories written for a chosen list of legends
+# (legend_evergreen.py): one per slot, so a run can be repeated and resumed.
+EVERGREEN_SLOT_KEY = "{profile_id}:evergreen:{slot}"
+
 STORY_OUTPUT_JSON_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -521,8 +570,17 @@ class DailyStoryWorker:
         trend_provider: Optional[str] = None,
         enforce_profile_quality: Optional[bool] = None,
         profile_quality_min_score: Optional[int] = None,
+        mongodb_uri: Optional[str] = None,
+        load_env_file: bool = True,
+        read_only: bool = False,
     ) -> None:
-        load_dotenv(dotenv_path=".env")
+        # A script that names its database explicitly (legend_evergreen,
+        # legend_child_bio) loads no .env: in a working copy that file points
+        # at production. read_only wraps the database so nothing can be
+        # written (readonly_mongo), for dry runs against production.
+        if load_env_file:
+            load_dotenv(dotenv_path=".env")
+        self.read_only = read_only
 
         suppress_vertex_deprecation_warning = (
             safe_text(os.getenv("STORY_SUPPRESS_VERTEX_DEPRECATION_WARNING")).lower() in {"1", "true", "yes", "on"}
@@ -536,13 +594,15 @@ class DailyStoryWorker:
                 category=UserWarning,
             )
 
-        mongodb_uri = os.getenv("MONGODB_URI")
+        mongodb_uri = mongodb_uri or os.getenv("MONGODB_URI")
         if not mongodb_uri:
             raise ValueError("MONGODB_URI not found in environment variables")
 
         self.mongo_client = create_mongo_client(mongodb_uri)
         db_name = resolve_mongo_db_name(mongodb_uri, client=self.mongo_client)
         self.db = self.mongo_client[db_name]
+        if read_only:
+            self.db = ReadOnlyDatabase(self.db, "this dry run")
 
         self.scholars_collection = self.db[scholars_collection]
         self.stories_collection = self.db[stories_collection]
@@ -760,7 +820,8 @@ class DailyStoryWorker:
             except Exception as exc:
                 raise RuntimeError(f"Failed to initialize Vertex AI model '{self.model_name}': {exc}") from exc
 
-        self._create_indexes()
+        if not read_only:
+            self._create_indexes()
 
     def _create_indexes(self) -> None:
         self.stories_collection.create_index("story_key", unique=True)
@@ -3334,7 +3395,12 @@ Today's events:
         return parts
 
     @staticmethod
-    def _build_disclosure(name: str, assume_deceased: bool) -> str:
+    def _build_disclosure(name: str, assume_deceased: bool, mode: str = STORY_MODE_NEWS) -> str:
+        if mode == STORY_MODE_EVERGREEN:
+            return (
+                f"AI-generated story about {name}, written from published sources about their life and work. "
+                f"It is not written by {name}."
+            )
         if assume_deceased:
             return (
                 f"AI-generated perspective inspired by the published scholarship of {name}. "
@@ -3367,6 +3433,96 @@ Today's events:
                 break
         return anchors
 
+    def _build_evergreen_prompt(
+        self,
+        name: str,
+        topic: str,
+        context_chunks: List[Dict[str, str]],
+        allowed_source_urls: List[str],
+        assume_deceased: bool,
+    ) -> str:
+        """The writer's brief for an evergreen story: the legend's life and
+        work from their reviewed passages alone, no news, in the evergreen
+        sections (EVERGREEN_SECTION_BLUEPRINT)."""
+        context_blob = "\n\n".join(
+            f"[chunk_id={chunk['chunk_id']}][section={chunk['section']}]\n{chunk['text']}"
+            for chunk in context_chunks
+        )
+        allowed_blob = ", ".join(chunk["chunk_id"] for chunk in context_chunks)
+        required_source_count = min(self.min_source_url_citations, len(allowed_source_urls)) if allowed_source_urls else 0
+        sources = "\n".join(f"- {u}" for u in allowed_source_urls[: self.max_source_url_candidates]) or "- none"
+        posthumous_rule = (
+            f"Write about {name} in the past tense as someone who has died; never suggest they are alive or writing today."
+            if assume_deceased
+            else f"Write about {name} in the third person."
+        )
+        blueprint = "\n".join(f"  {index}) {heading}" for index, heading in enumerate(EVERGREEN_SECTION_BLUEPRINT, start=1))
+        return f"""Write an evergreen story about the life and work of {name} for an educational reading platform.
+It is not about any news event and says nothing about current events: it tells who {name} was, what they worked on,
+one idea from their work a young reader could hold on to, and why it mattered. Older readers read it as written;
+separate versions for each age are made from it later, so be accurate and complete rather than simple.
+
+This story's focus within {name}'s documented work: {topic}
+
+The passages below are the only facts you may use. They come from source pages reviewed as being about {name}.
+Every claim about {name}'s life, work, ideas, dates, places and the people around them must come from a passage,
+with the passage cited right after it as [chunk:CHUNK_ID].
+
+Sections (H2 markdown headings, exactly these, in this order), then Sources:
+{blueprint}
+  {len(EVERGREEN_SECTION_BLUEPRINT) + 1}) Sources
+- "{EVERGREEN_SECTION_BLUEPRINT[0]}": who {name} was, when and where they lived and worked, as the passages tell it.
+- "{EVERGREEN_SECTION_BLUEPRINT[1]}": the questions, field and works the passages describe.
+- "{EVERGREEN_SECTION_BLUEPRINT[2]}": one idea, finding or practice from their work, explained clearly, with one concrete example from the passages.
+- "{EVERGREEN_SECTION_BLUEPRINT[3]}": what the passages say their work changed or made possible, and for whom.
+- "{EVERGREEN_SECTION_BLUEPRINT[4]}": a closing that ties the story together without adding any fact.
+- Each of the five sections has at least two paragraphs and at least {EVERGREEN_MIN_SECTION_WORDS + 20} words; the story is
+  {EVERGREEN_MIN_ARTICLE_WORDS} to {EVERGREEN_MAX_ARTICLE_WORDS} words.
+- Name at least two years or dates the passages give.
+
+Rules:
+1. Cite a passage in the first paragraph of every section, and wherever a sentence draws on one, as [chunk:CHUNK_ID],
+   using only the allowed chunk IDs below; at least 4 different passages in all.
+2. Add no fact, date, number, name or quotation that is not in the passages. Quote {name} only with words a passage quotes.
+3. {posthumous_rule} Never write as {name}, never give a byline such as "By {name}", and never use first-person words
+   (I, me, my, mine, we, our, us).
+4. Say nothing about news, current events, today's politics or what will happen next.
+5. Do not support a claim that something caused something else with a passage that only lists publications.
+6. Plain, warm, concrete sentences; explain any technical term the first time it is used.
+7. `claim_evidence_map`: at least 4 rows, each a claim from the story and the chunk IDs that support it.
+8. `source_urls`: at least {required_source_count} URLs copied exactly from the allowed URL list below, and nothing else.
+   End article_markdown with a `## Sources` section listing each URL in `source_urls` as a bullet.
+9. `trend_source_url`: an empty string (there is no news item).
+10. Return only JSON.
+
+Allowed source URLs (the pages the passages come from; use exact strings only):
+{sources}
+
+Required JSON schema:
+{{
+  "title": "string",
+  "standfirst": "string",
+  "article_markdown": "string",
+  "trend_source_url": "",
+  "source_urls": ["https://..."],
+  "claim_evidence_map": [
+    {{
+      "claim": "string",
+      "chunk_ids": ["chunk_id_1", "chunk_id_2"],
+      "support_summary": "string"
+    }}
+  ],
+  "used_chunk_ids": ["chunk1", "chunk2"],
+  "editor_notes": ["short note", "short note"]
+}}
+
+Passages:
+{context_blob}
+
+Allowed chunk IDs (must be copied exactly):
+{allowed_blob}
+"""
+
     def _build_prompt(
         self,
         name: str,
@@ -3376,7 +3532,10 @@ Today's events:
         style_profile: Dict[str, Any],
         allowed_source_urls: List[str],
         assume_deceased: bool,
+        mode: str = STORY_MODE_NEWS,
     ) -> str:
+        if mode == STORY_MODE_EVERGREEN:
+            return self._build_evergreen_prompt(name, topic, context_chunks, allowed_source_urls, assume_deceased)
         context_lines = []
         allowed_chunk_ids = []
         for chunk in context_chunks:
@@ -4266,6 +4425,44 @@ Malformed output:
             ],
         }
 
+    def _evergreen_placeholder_payload(
+        self,
+        *,
+        name: str,
+        topic: str,
+        context_chunks: List[Dict[str, str]],
+        allowed_source_urls: List[str],
+    ) -> Dict[str, Any]:
+        """A dry run's stand-in for an evergreen draft: the evergreen sections,
+        each citing a passage, marked dry_run_generated so it is never sent
+        to review."""
+        used_ids = [c["chunk_id"] for c in context_chunks[:4]] or ["missing-1"]
+        cite = lambda index: used_ids[index % len(used_ids)]  # noqa: E731
+        sections = []
+        for index, heading in enumerate(EVERGREEN_SECTION_BLUEPRINT):
+            sections.append(
+                f"## {heading}\n"
+                f"[chunk:{cite(index)}] Placeholder paragraph about {name} ({topic}), for a dry run.\n\n"
+                f"A second placeholder paragraph; no model was asked.\n"
+            )
+        source_urls = list(dict.fromkeys(safe_text(u) for u in allowed_source_urls if safe_text(u)))[: max(self.min_source_url_citations, 6)]
+        article = "\n".join(sections)
+        if source_urls:
+            article = self._upsert_sources_section(article, source_urls)
+        return {
+            "title": f"{name}: {topic}",
+            "standfirst": "Synthetic evergreen draft for a dry run. Not for publication.",
+            "article_markdown": article,
+            "trend_source_url": "",
+            "source_urls": source_urls,
+            "claim_evidence_map": [
+                {"claim": f"Placeholder claim {n + 1} about {name}.", "chunk_ids": [cite(n)], "support_summary": "dry run"}
+                for n in range(4)
+            ],
+            "used_chunk_ids": used_ids,
+            "editor_notes": ["dry_run_generated"],
+        }
+
     def _generate_story_payload(
         self,
         *,
@@ -4277,7 +4474,10 @@ Malformed output:
         allowed_source_urls: List[str],
         assume_deceased: bool,
         dry_run: bool,
+        mode: str = STORY_MODE_NEWS,
     ) -> Dict[str, Any]:
+        if (dry_run or not self.use_llm) and mode == STORY_MODE_EVERGREEN:
+            return self._evergreen_placeholder_payload(name=name, topic=topic, context_chunks=context_chunks, allowed_source_urls=allowed_source_urls)
         if dry_run or not self.use_llm:
             used_ids = [c["chunk_id"] for c in context_chunks[:4]]
             c1 = used_ids[0] if used_ids else "chunk:missing-1"
@@ -4356,6 +4556,7 @@ Malformed output:
             style_profile,
             allowed_source_urls,
             assume_deceased,
+            mode=mode,
         )
         max_tokens = self.max_output_tokens
         try:
@@ -4363,6 +4564,11 @@ Malformed output:
         except Exception as exc:
             if self.strict_llm_only:
                 raise RuntimeError(f"strict_llm_only_generation_error:{safe_text(exc)}") from exc
+            # The fallback is the news template; it always fails review as a
+            # template (template_failure), so an evergreen story that the
+            # model did not write is a failed generation, said as such.
+            if mode == STORY_MODE_EVERGREEN:
+                raise RuntimeError(f"evergreen_generation_error:{safe_text(exc)}") from exc
             return self._build_llm_failure_fallback_payload(
                 name=name,
                 topic=topic,
@@ -4430,6 +4636,26 @@ Malformed output:
             ) if part
         ) or "None."
         blocks = "\n\n".join(f"### {heading}\n{body}" for heading, body in sections)
+        if not safe_text(issue.get("title")):
+            # An evergreen story has no news item: its sections rest on the
+            # passages alone.
+            return f"""You revise sections of an AI-written story about the life and work of {name}, a scholar our students study.
+Each section below failed one check: a section must be grounded in {name}'s passages, with an inline citation such as [chunk:ID] in its first paragraph, citing the passage it draws on.
+
+Rewrite only these sections. For each:
+- Keep the section's point.
+- In its first paragraph, restate in your own words something specific from a passage (a work, an idea, a finding, a date) and cite it right after as [chunk:ID]. Cite again wherever you draw on a passage later.
+- Cite only the IDs listed below. Add no fact that is not in the passages, and say nothing about news or current events.
+- Keep at least two paragraphs and about the same length. Write about {name} in the third person, and never use "we", "our" or "us".
+- Return the section's text without its heading.
+
+{name.upper()}'S PASSAGES
+{passages}
+
+SECTIONS TO REVISE
+{blocks}
+
+Return JSON: {{"sections": [{{"heading": "<the heading exactly as given>", "markdown": "<the revised section text>"}}]}}"""
         return f"""You revise sections of an AI-written article on a news event, seen through the published work of {name}, a scholar our students study.
 Each section below failed one check: a section must be grounded in {name}'s passages, with an inline citation such as [chunk:ID] in its first paragraph, citing the passage it draws on.
 
@@ -4512,6 +4738,7 @@ Return JSON: {{"sections": [{{"heading": "<the heading exactly as given>", "mark
         assume_deceased: bool,
         failed_payload: Dict[str, Any],
         validation_errors: List[str],
+        mode: str = STORY_MODE_NEWS,
     ) -> Dict[str, Any]:
         """
         One-shot corrective rewrite when initial draft fails safety/format checks.
@@ -4524,9 +4751,30 @@ Return JSON: {{"sections": [{{"heading": "<the heading exactly as given>", "mark
             style_profile,
             allowed_source_urls,
             assume_deceased,
+            mode=mode,
         )
         failed_json = json.dumps(failed_payload, ensure_ascii=False)
         errors_blob = ", ".join(validation_errors)
+        if mode == STORY_MODE_EVERGREEN:
+            repair_prompt = f"""{base_prompt}
+
+The previous draft failed validation.
+Validation errors:
+{errors_blob}
+
+Previous draft JSON:
+{failed_json}
+
+Rewrite the story to satisfy every rule above. Critical fixes:
+- Remove all first-person words and any byline; write about {name} in the third person.
+- Use the sections exactly as listed, each with at least two paragraphs and a citation in its first paragraph.
+- At least 4 different passages cited as [chunk:CHUNK_ID], only allowed IDs; used_chunk_ids only allowed IDs.
+- claim_evidence_map with at least 4 rows; no causal claim resting on a publications-only passage.
+- source_urls only from the allowed list, listed under a closing `## Sources` section; trend_source_url empty.
+- Nothing that is not in the passages, and nothing about news or current events.
+Return only JSON.
+"""
+            return self._call_llm_json(repair_prompt, max_tokens=max(2600, int(self.max_output_tokens * 0.9)))
         repair_prompt = f"""{base_prompt}
 
 The previous draft failed validation.
@@ -4943,23 +5191,28 @@ Return only JSON.
         h = safe_text(heading).lower()
         return any(k in h for k in ("sources", "references", "citations", "notes"))
 
-    def _validate_standard_article_structure(self, article_markdown: str) -> List[str]:
+    def _validate_standard_article_structure(self, article_markdown: str, mode: str = STORY_MODE_NEWS) -> List[str]:
         errors: List[str] = []
         text = safe_text(article_markdown)
         if not text:
             return ["article_empty"]
 
+        evergreen = mode == STORY_MODE_EVERGREEN
+        min_words = EVERGREEN_MIN_ARTICLE_WORDS if evergreen else self.min_article_words
+        min_sections = len(EVERGREEN_SECTION_BLUEPRINT) if evergreen else self.min_major_sections
+        min_section_words = EVERGREEN_MIN_SECTION_WORDS if evergreen else self.min_section_words
+
         total_words = self._count_words(text)
-        if total_words < self.min_article_words:
+        if total_words < min_words:
             errors.append(f"article_word_count_below_minimum:{total_words}")
 
         sections = self._extract_markdown_sections(text)
         major_sections = [s for s in sections if not self._is_sources_heading(s.get("heading"))]
-        if len(major_sections) < self.min_major_sections:
+        if len(major_sections) < min_sections:
             errors.append("insufficient_major_sections")
 
         heading_blob = " || ".join([safe_text(s.get("heading")).lower() for s in major_sections])
-        required_heading_groups = {
+        required_heading_groups = EVERGREEN_HEADING_GROUPS if evergreen else {
             "why_now": [r"\bwhy this matters now\b", r"\bwhat(?:'s| is) at stake\b", r"\burgency\b"],
             "historical": [r"\bhistorical\b", r"\bbackground\b", r"\bcontext\b"],
             "scholar_lens": [r"\bscholar\b", r"\bcore argument\b", r"\blens\b", r"\bframework\b"],
@@ -4978,10 +5231,10 @@ Return only JSON.
             heading = safe_text(sec.get("heading")) or "Section"
             body = safe_text(sec.get("text"))
             section_words = self._count_words(body)
-            if section_words < self.min_section_words:
+            if section_words < min_section_words:
                 short_sections.append(heading)
             paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
-            if section_words >= self.min_section_words and len(paragraphs) < 2:
+            if section_words >= min_section_words and len(paragraphs) < 2:
                 shallow_sections.append(heading)
 
         if short_sections:
@@ -5848,6 +6101,7 @@ Return only JSON.
         allowed_source_urls: List[str],
         allowed_chunk_ids: set,
         assume_deceased: bool,
+        mode: str = STORY_MODE_NEWS,
     ) -> Tuple[bool, List[str], List[str], List[str], List[Dict[str, Any]], str]:
         errors: List[str] = []
         warnings: List[str] = []
@@ -5872,7 +6126,7 @@ Return only JSON.
         if len(article) < 500:
             errors.append("article_too_short")
         if self.require_standard_structure and (not is_dry_placeholder):
-            structure_errors = self._validate_standard_article_structure(article)
+            structure_errors = self._validate_standard_article_structure(article, mode=mode)
             errors.extend(structure_errors)
             lens_errors, lens_warnings = self._validate_scholar_lens_presence(article, name)
             errors.extend(lens_errors)
@@ -5997,6 +6251,685 @@ Return only JSON.
             trend_source_url,
         )
 
+    # ── Writing one story ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _reviewed_page_keys(scholar_doc: Dict[str, Any]) -> set:
+        """The source pages the legend's current identity review ruled are
+        about the legend (read before restricted_to_reviewed_sources, which
+        drops the review from its copy)."""
+        review = legend_identity.current_review(scholar_doc) or {}
+        return set(review.get("allowed_page_keys") or [])
+
+    @staticmethod
+    def _with_creditable_passages(scholar_doc: Dict[str, Any]) -> Dict[str, Any]:
+        """A copy of a (restricted) legend holding only the passages an
+        evergreen story may cite: those with a page to credit them to. A
+        passage with no link could not be attributed. Text built from all
+        pages together (section_text) is dropped too, for the same reason."""
+        out = dict(scholar_doc)
+        rag_context = dict(scholar_doc.get("rag_context") or {})
+        sections = rag_context.get("section_chunks") or {}
+        kept = {}
+        if isinstance(sections, dict):
+            for section, chunks in sections.items():
+                if not isinstance(chunks, list):
+                    continue
+                with_links = [c for c in chunks if isinstance(c, dict) and legend_identity.chunk_links(c)]
+                if with_links:
+                    kept[section] = with_links
+        rag_context["section_chunks"] = kept
+        rag_context["section_text"] = {}
+        out["rag_context"] = rag_context
+        return out
+
+    def _evergreen_source_urls(self, context_chunks: List[Dict[str, Any]]) -> List[str]:
+        """An evergreen story's allowed sources: the pages its passages come
+        from (each already ruled about the legend by its identity review),
+        never a refused publisher's, first link of each passage first."""
+        urls: List[str] = []
+        seen = set()
+        for chunk in context_chunks:
+            for url in legend_identity.chunk_links(chunk):
+                key = legend_identity.page_key(url)
+                if key in seen or excluded_publisher(url) or not self._is_valid_external_url(url):
+                    continue
+                seen.add(key)
+                urls.append(self._clean_url_candidate(url))
+        return urls[: self.max_source_url_candidates]
+
+    def _attribute_cited_pages(
+        self,
+        payload: Dict[str, Any],
+        context_chunks: List[Dict[str, Any]],
+        allowed_source_urls: List[str],
+    ) -> Dict[str, Any]:
+        """The draft with the page of every passage it cites listed in its
+        sources and its Sources section: crediting a source is carried out in
+        code, not left to the writer."""
+        allowed_by_page = {legend_identity.page_key(u): u for u in allowed_source_urls}
+        listed = [safe_text(u) for u in (payload.get("source_urls") or []) if safe_text(u)]
+        listed_pages = {legend_identity.page_key(u) for u in listed}
+        cited = set(self._extract_inline_citations(safe_text(payload.get("article_markdown"))))
+        cited |= {safe_text(c) for c in (payload.get("used_chunk_ids") or []) if safe_text(c)}
+        added: List[str] = []
+        for chunk in context_chunks:
+            if chunk["chunk_id"] not in cited:
+                continue
+            page = legend_identity.chunk_page_key(chunk)
+            if page in listed_pages or page not in allowed_by_page:
+                continue
+            listed_pages.add(page)
+            added.append(allowed_by_page[page])
+        if not added:
+            return payload
+        source_urls = (listed + added)[: self.max_source_url_candidates]
+        out = dict(payload)
+        out["source_urls"] = source_urls
+        out["article_markdown"] = self._upsert_sources_section(safe_text(payload.get("article_markdown")), source_urls)
+        notes = out.get("editor_notes") if isinstance(out.get("editor_notes"), list) else []
+        out["editor_notes"] = list(dict.fromkeys([*[safe_text(n) for n in notes if safe_text(n)], "cited_pages_attributed"]))
+        return out
+
+    def _evergreen_source_record(
+        self,
+        *,
+        source_urls: List[str],
+        cited_chunk_ids: List[str],
+        context_chunks: List[Dict[str, Any]],
+        reviewed_page_keys: set,
+    ) -> Dict[str, Any]:
+        """What an evergreen story was written from, page by page: whether the
+        page is allowed (its identity review ruled it about the legend, and
+        its publisher's terms are not known to forbid this use), whether the
+        story credits it (listed under Sources), and its licence as far as it
+        is known (source_licences)."""
+        pages: Dict[str, Dict[str, Any]] = {}
+
+        def page_for(url: str) -> Dict[str, Any]:
+            key = legend_identity.page_key(url)
+            if key not in pages:
+                licence = licence_for(url)
+                pages[key] = {
+                    "url": url,
+                    "page_key": key,
+                    "chunk_ids": [],
+                    "cited": False,
+                    "listed": False,
+                    "reviewed": key in reviewed_page_keys,
+                    "licence": licence,
+                    "allowed": key in reviewed_page_keys and licence["status"] != REFUSED,
+                }
+            return pages[key]
+
+        cited = set(cited_chunk_ids)
+        for chunk in context_chunks:
+            if chunk["chunk_id"] not in cited:
+                continue
+            links = legend_identity.chunk_links(chunk)
+            if not links:
+                continue
+            page = page_for(links[0])
+            page["cited"] = True
+            page["chunk_ids"].append(chunk["chunk_id"])
+        for url in source_urls:
+            page_for(url)["listed"] = True
+
+        rows = list(pages.values())
+        return {
+            "policy_version": EVERGREEN_POLICY_VERSION,
+            "licence_policy_version": LICENCE_POLICY_VERSION,
+            "news_item": None,
+            "pages": rows,
+            "all_allowed": all(row["allowed"] for row in rows),
+            "all_cited_attributed": all(row["listed"] for row in rows if row["cited"]),
+            "open_licence_pages": sum(1 for row in rows if row["licence"]["status"] == OPEN),
+            "unknown_licence_pages": sum(1 for row in rows if row["licence"]["status"] not in (OPEN, REFUSED)),
+        }
+
+    @staticmethod
+    def _source_record_errors(record: Dict[str, Any]) -> List[str]:
+        errors: List[str] = []
+        for row in record.get("pages") or []:
+            if not row["allowed"]:
+                errors.append(f"evergreen_source_not_allowed:{row['page_key']}")
+            if row["cited"] and not row["listed"]:
+                errors.append(f"evergreen_cited_page_not_attributed:{row['page_key']}")
+        return errors
+
+    def _write_and_store(
+        self,
+        *,
+        profile_id: str,
+        professor_name: str,
+        scholar_doc: Dict[str, Any],
+        reviewed_page_keys: set,
+        story_key: str,
+        story_date: str,
+        topic: str,
+        topic_source: str,
+        ml_topic_count: int,
+        context_chunks: List[Dict[str, Any]],
+        style_profile: Dict[str, Any],
+        trend_issue: Optional[Dict[str, Any]],
+        trend_relevance: Dict[str, Any],
+        mode: str,
+        dry_run: bool,
+        run_id: str,
+        force_regenerate: bool,
+        existing_story: Optional[Dict[str, Any]],
+        existing_status: str,
+        profile_quality: Tuple[str, int],
+        summary: Dict[str, int],
+        all_errors: List[str],
+        evergreen_slot: Optional[int] = None,
+    ) -> Optional[str]:
+        """Writes one story (a draft, its checks and repairs) and stores it
+        under story_key, counting the outcome in summary and all_errors.
+        Shared by the nightly run (news, or evergreen when there is no news
+        item) and by evergreen writing for a chosen list of legends
+        (write_evergreen_slot). Returns the stored status, or None when
+        nothing was stored."""
+        evergreen = mode == STORY_MODE_EVERGREEN
+        profile_quality_status, profile_quality_score = profile_quality
+        allowed_chunk_ids = {c["chunk_id"] for c in context_chunks}
+        disclosure = self._build_disclosure(professor_name, self.assume_deceased, mode)
+        if evergreen:
+            allowed_source_urls = self._evergreen_source_urls(context_chunks)
+        else:
+            allowed_source_urls = self._collect_allowed_source_urls(
+                profile_id=profile_id,
+                scholar_doc=scholar_doc,
+                trend_issue=trend_issue,
+            )
+
+        def enforce(draft: Dict[str, Any]) -> Dict[str, Any]:
+            draft, _ = self._enforce_source_url_citations(payload=draft, allowed_source_urls=allowed_source_urls)
+            if evergreen:
+                # There is no news item behind an evergreen story.
+                draft = {**draft, "trend_source_url": ""}
+                draft = self._attribute_cited_pages(draft, context_chunks, allowed_source_urls)
+            return draft
+
+        def validate(draft: Dict[str, Any]):
+            return self._validate_story(
+                name=professor_name,
+                payload=draft,
+                context_chunks=context_chunks,
+                trend_issue=trend_issue,
+                allowed_source_urls=allowed_source_urls,
+                allowed_chunk_ids=allowed_chunk_ids,
+                assume_deceased=self.assume_deceased,
+                mode=mode,
+            )
+
+        def noted(draft: Dict[str, Any], note: str) -> Dict[str, Any]:
+            notes = draft.get("editor_notes")
+            if not isinstance(notes, list):
+                notes = []
+            notes.append(note)
+            draft["editor_notes"] = notes
+            return draft
+
+        try:
+            payload = self._generate_story_payload(
+                name=professor_name,
+                topic=topic,
+                trend_issue=trend_issue,
+                style_profile=style_profile,
+                context_chunks=context_chunks,
+                allowed_source_urls=allowed_source_urls,
+                assume_deceased=self.assume_deceased,
+                dry_run=dry_run,
+                mode=mode,
+            )
+        except Exception as exc:
+            summary["failed_generation"] += 1
+            all_errors.append(f"{profile_id}:generation_error:{exc}")
+            return None
+
+        payload = enforce(payload)
+        valid, errors, warnings, used_chunk_ids, normalized_claim_map, trend_source_url = validate(payload)
+
+        if not valid:
+            patched_payload, patched = self._apply_reliability_fallbacks(
+                payload=payload,
+                name=professor_name,
+                trend_issue=trend_issue,
+                context_chunks=context_chunks,
+                allowed_chunk_ids=allowed_chunk_ids,
+            )
+            if patched:
+                patched_payload = enforce(patched_payload)
+                p_valid, p_errors, p_warnings, p_used_chunk_ids, p_claim_map, p_trend_source_url = validate(patched_payload)
+                if p_valid or len(p_errors) < len(errors):
+                    payload = noted(patched_payload, "deterministic_reliability_patch")
+                    valid, errors, warnings = p_valid, p_errors, p_warnings
+                    used_chunk_ids, normalized_claim_map, trend_source_url = p_used_chunk_ids, p_claim_map, p_trend_source_url
+
+        # Sections failing only for want of a grounded citation are
+        # rewritten on their own first (SECTION_CITATION_ERROR_PREFIXES).
+        if (not valid) and self.use_llm and (not dry_run) and self._sections_failing_citations(errors):
+            try:
+                section_payload = self._repair_section_citations(
+                    name=professor_name,
+                    payload=payload,
+                    errors=errors,
+                    context_chunks=context_chunks,
+                    trend_issue=trend_issue,
+                )
+            except Exception:
+                section_payload = None
+                warnings.append("section_repair_failed")
+            if section_payload:
+                section_payload = enforce(section_payload)
+                s_valid, s_errors, s_warnings, s_used_chunk_ids, s_claim_map, s_trend_source_url = validate(section_payload)
+                if s_valid or len(s_errors) < len(errors):
+                    payload = noted(section_payload, "section_citation_repair")
+                    valid, errors, warnings = s_valid, s_errors, s_warnings
+                    used_chunk_ids, normalized_claim_map, trend_source_url = s_used_chunk_ids, s_claim_map, s_trend_source_url
+
+        if (not valid) and self.use_llm and (not dry_run):
+            repair_candidates = [
+                err for err in errors
+                if (
+                    err.startswith("persona_violation")
+                    or err.startswith("byline_impersonation")
+                    or err.startswith("byline_impersonation_payload_field")
+                    or err.startswith("unknown_inline_citations")
+                    or err.startswith("unknown_used_chunk_ids")
+                    or err.startswith("claim_map_")
+                    or err.startswith("section_missing_citation")
+                    or err.startswith("section_citation_end_loaded")
+                    or err.startswith("section_weak_citation_grounding")
+                    or err.startswith("section_missing_early_strong_citation")
+                    or err.startswith("section_unknown_or_missing_citations")
+                    or err.startswith("weak_paragraph_grounding")
+                    or err.startswith("unknown_article_urls")
+                    or err.startswith("article_word_count_below_minimum")
+                    or err.startswith("missing_required_section")
+                    or err.startswith("underdeveloped_sections")
+                    or err.startswith("single_paragraph_sections")
+                    or err in {
+                        "insufficient_inline_citations",
+                        "article_too_short",
+                        "insufficient_scholar_specific_grounding",
+                        "insufficient_concrete_details",
+                        "insufficient_major_sections",
+                        "missing_sources_section",
+                        "insufficient_claim_evidence_map_items",
+                        "claim_evidence_map_below_minimum_after_normalization",
+                        "missing_or_invalid_trend_source_url",
+                        "trend_source_url_mismatch",
+                        "source_urls_not_in_allowed_pool",
+                        "insufficient_source_url_citations",
+                        "source_url_missing_from_sources_section",
+                        "causal_claim_publications_only_evidence",
+                        "causal_paragraph_publications_only_evidence",
+                        "causal_claim_missing_valid_citation",
+                    }
+                )
+            ]
+            if repair_candidates:
+                try:
+                    repaired_payload = self._repair_story_payload(
+                        name=professor_name,
+                        topic=topic,
+                        trend_issue=trend_issue,
+                        style_profile=style_profile,
+                        context_chunks=context_chunks,
+                        allowed_source_urls=allowed_source_urls,
+                        assume_deceased=self.assume_deceased,
+                        failed_payload=payload,
+                        validation_errors=errors,
+                        mode=mode,
+                    )
+                    repaired_payload = enforce(repaired_payload)
+                    r_valid, r_errors, r_warnings, r_used_chunk_ids, r_claim_map, r_trend_source_url = validate(repaired_payload)
+                    if r_valid or len(r_errors) < len(errors):
+                        payload = noted(repaired_payload, "auto_repair_pass")
+                        valid, errors, warnings = r_valid, r_errors, r_warnings
+                        used_chunk_ids, normalized_claim_map, trend_source_url = r_used_chunk_ids, r_claim_map, r_trend_source_url
+                except Exception:
+                    warnings.append("auto_repair_failed")
+
+        # The strict fallback is the news template: an evergreen story never
+        # takes it, since a template is never sent to review anyway.
+        if not valid and (not self.strict_llm_only) and not evergreen:
+            strict_fallback_payload = self._build_strict_validation_fallback_payload(
+                name=professor_name,
+                topic=topic,
+                trend_issue=trend_issue,
+                context_chunks=context_chunks,
+                allowed_source_urls=allowed_source_urls,
+                note=f"strict_fallback_after_errors:{'|'.join(errors)[:300]}",
+            )
+            strict_fallback_payload = enforce(strict_fallback_payload)
+            sf_valid, sf_errors, sf_warnings, sf_used_chunk_ids, sf_claim_map, sf_trend_source_url = validate(strict_fallback_payload)
+            if sf_valid or len(sf_errors) < len(errors):
+                payload = noted(strict_fallback_payload, "strict_validation_fallback_pass")
+                valid, errors, warnings = sf_valid, sf_errors, sf_warnings
+                used_chunk_ids, normalized_claim_map, trend_source_url = sf_used_chunk_ids, sf_claim_map, sf_trend_source_url
+
+        # A template is not an article. The two fallbacks above write fixed
+        # prose around the headline: one when the model gave nothing usable,
+        # one when its draft failed validation. Sent to review as finished
+        # stories, 29 of the first 30 legend drafts in the queue were
+        # templates (2026-10-29: the model call had been refused with a 403),
+        # and the admin pipeline rated them "every check passed". A template
+        # now fails, so the retry stage writes the story again.
+        template_error = template_failure(payload.get("editor_notes"), dry_run=dry_run)
+        if template_error:
+            valid = False
+            errors = [*errors, template_error]
+
+        selected_source_urls = payload.get("source_urls")
+        if not isinstance(selected_source_urls, list):
+            selected_source_urls = []
+        selected_source_urls = [safe_text(u) for u in selected_source_urls if safe_text(u)]
+
+        source_record: Optional[Dict[str, Any]] = None
+        if evergreen:
+            cited_ids = list(dict.fromkeys(
+                [*used_chunk_ids, *self._normalize_chunk_ids(self._extract_inline_citations(safe_text(payload.get("article_markdown"))), allowed_chunk_ids)[0]]
+            ))
+            source_record = self._evergreen_source_record(
+                source_urls=selected_source_urls,
+                cited_chunk_ids=cited_ids,
+                context_chunks=context_chunks,
+                reviewed_page_keys=reviewed_page_keys,
+            )
+            record_errors = self._source_record_errors(source_record)
+            if record_errors:
+                valid = False
+                errors = [*errors, *record_errors]
+
+        status = "pending_review" if self.require_human_review else "generated"
+        if not valid:
+            status = "failed_validation"
+            summary["failed_validation"] += 1
+            all_errors.append(f"{profile_id}:failed_validation:{'|'.join(errors)}")
+
+        article_markdown = safe_text(payload.get("article_markdown"))
+        reader_article_markdown = self._sanitize_reader_article_markdown(article_markdown)
+        if reader_article_markdown != article_markdown:
+            notes = payload.get("editor_notes")
+            if not isinstance(notes, list):
+                notes = []
+            notes.append("reader_sanitized")
+            payload["editor_notes"] = list(dict.fromkeys([safe_text(n) for n in notes if safe_text(n)]))
+        article_markdown = reader_article_markdown
+        if disclosure not in article_markdown:
+            article_markdown = f"> {disclosure}\n\n{article_markdown}"
+
+        used_context = [c for c in context_chunks if c["chunk_id"] in set(used_chunk_ids)]
+        if not used_context:
+            used_context = context_chunks[:4]
+        sentence_source_map = self._build_sentence_source_map(
+            article_markdown=article_markdown,
+            context_chunks=context_chunks,
+            allowed_chunk_ids=allowed_chunk_ids,
+            fallback_source_urls=selected_source_urls,
+        )
+
+        story_doc = {
+            "story_key": story_key,
+            "story_date": story_date,
+            "status": status,
+            "story_mode": mode,
+            "topic": topic,
+            "topic_selection": {
+                "source": topic_source,
+                "ml_topic_candidates_count": ml_topic_count,
+            },
+            "topic_modeling": {
+                "primary_model": "nmf",
+                "selection_mode": "evergreen_slot" if evergreen_slot else "seeded_weighted_random_daily",
+            },
+            "scholar": {
+                "profile_id": profile_id,
+                "name": professor_name,
+                "profile_quality": {
+                    "status": profile_quality_status,
+                    "score": profile_quality_score,
+                    "enforced": self.enforce_profile_quality,
+                },
+            },
+            "trend_issue": {
+                "enabled": self.trends_enabled and not evergreen,
+                "provider": self.trend_provider,
+                "selected": trend_issue or {},
+                "verified_source_url": trend_source_url,
+                "relevance": trend_relevance,
+            },
+            "style_profile": style_profile,
+            "content": {
+                "title": safe_text(payload.get("title")),
+                "standfirst": safe_text(payload.get("standfirst")),
+                "article_markdown": article_markdown,
+                "disclosure": disclosure,
+                "source_urls": selected_source_urls,
+            },
+            "presentation": {
+                "allow_scholar_byline": False,
+                "author_label": "AI-generated perspective",
+            },
+            "citations": [
+                {
+                    "chunk_id": c["chunk_id"],
+                    "section": c["section"],
+                    "evidence_excerpt": c["text"][:350],
+                    "source_urls": self._chunk_source_urls(c),
+                    "source_refs": (c.get("source_refs") if isinstance(c.get("source_refs"), list) else [])[:3],
+                }
+                for c in used_context
+            ],
+            "source_url_citations": [{"url": u} for u in selected_source_urls],
+            "sentence_source_map": sentence_source_map,
+            "generation": {
+                "mode": "dry_run" if dry_run or not self.use_llm else "llm",
+                "story_mode": mode,
+                "model": "none" if dry_run or not self.use_llm else self.model_name,
+                "generated_at": utc_now_iso(),
+                "run_id": run_id,
+                "editor_notes": payload.get("editor_notes") or [],
+            },
+            "claim_evidence_map": normalized_claim_map,
+            "ml_retrieval": {
+                "strategy": "hybrid_dense_lexical_section_prior",
+                "embedding_model": self.embedding_model_name if self.ml_enabled else "disabled",
+                "cross_encoder_reranker": {
+                    "enabled": bool(self.cross_encoder_enabled and self.ml_enabled),
+                    "active": bool(self.cross_encoder_enabled and self.ml_enabled and not self._cross_encoder_unavailable),
+                    "model": self.cross_encoder_model_name if self.cross_encoder_enabled else "disabled",
+                    "top_k": self.cross_encoder_rerank_top_k if self.cross_encoder_enabled else 0,
+                    "weight": self.cross_encoder_weight if self.cross_encoder_enabled else 0.0,
+                },
+                "topic_tokens_used": self._topic_tokens(topic),
+                "trend_tokens_used": self._topic_tokens(safe_text((trend_issue or {}).get("title"))),
+            },
+            "safety": {
+                "assume_deceased": self.assume_deceased,
+                "require_human_review": self.require_human_review,
+                "strict_reliability": self.strict_reliability,
+                "enforce_source_url_citations": self.enforce_source_url_citations,
+                "validation_passed": valid,
+                "errors": errors,
+                "warnings": warnings,
+            },
+        }
+        if evergreen:
+            story_doc["evergreen"] = {
+                "policy_version": EVERGREEN_POLICY_VERSION,
+                "slot": evergreen_slot,
+                "focus": topic,
+            }
+            story_doc["source_record"] = source_record
+
+        if force_regenerate and existing_story and existing_status != "failed_validation":
+            if valid:
+                self.stories_collection.replace_one({"_id": existing_story["_id"]}, story_doc)
+                summary["generated"] += 1
+                return status
+            all_errors.append(f"{profile_id}:regeneration_rejected_existing_story_retained")
+            return None
+
+        try:
+            self.stories_collection.insert_one(story_doc)
+            if valid:
+                summary["generated"] += 1
+            return status
+        except Exception as exc:
+            is_duplicate = bool(DuplicateKeyError is not None and isinstance(exc, DuplicateKeyError))
+            if is_duplicate:
+                try:
+                    self.stories_collection.replace_one({"story_key": story_key}, story_doc, upsert=True)
+                    if valid:
+                        summary["generated"] += 1
+                    return status
+                except Exception as replace_exc:
+                    summary["failed_generation"] += 1
+                    all_errors.append(f"{profile_id}:replace_error:{replace_exc}")
+                    return None
+            summary["failed_generation"] += 1
+            all_errors.append(f"{profile_id}:insert_error:{exc}")
+            return None
+
+    # ── Evergreen stories for a chosen list of legends ───────────────────────
+
+    def evergreen_focus_pool(self, scholar_doc: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """The distinct focuses a legend's evergreen stories can take, in a
+        fixed order, as (focus, how it was found): the corpus's modelled
+        topics, then its mined phrases, then its passage sections. Slot n of a
+        legend's evergreen stories takes the nth, so each story is on a
+        different part of the legend's work and a repeated run picks the same
+        one. Pass the legend as restricted_to_reviewed_sources returns it.
+
+        The topic miners word a topic for the news ("What history suggests
+        about X today"); a focus is X alone. A focus whose words are all in
+        another's, or hold all of another's, is the same focus."""
+        pool: List[Tuple[str, str]] = []
+        taken: List[set] = []
+
+        def add(focus: Any, source: str) -> None:
+            text = re.sub(r"\s+", " ", safe_text(focus)).strip()
+            framed = EVERGREEN_NEWS_TOPIC_FRAME.match(text)
+            if framed:
+                text = framed.group(1).strip()
+            words = set(self._phrase_tokens(text)) or {text.lower()}
+            if not text or any(words <= other or other <= words for other in taken):
+                return
+            taken.append(words)
+            pool.append((text, source))
+
+        for topic in self._model_topics_nmf(scholar_doc, max_topics=8):
+            add(topic.get("label_core") or topic.get("topic"), "nmf_topic_modeling")
+        for topic in self._mine_topic_candidates(scholar_doc, max_candidates=12):
+            add(topic, "ml_clustered_topics")
+        sections = ((scholar_doc.get("rag_context") or {}).get("section_chunks") or {})
+        if isinstance(sections, dict):
+            for section in sorted(sections, key=lambda s: (SECTION_PRIORITY.get(safe_text(s).lower(), 99), safe_text(s))):
+                add(safe_text(section).replace("_", " "), "corpus_section")
+        return pool
+
+    def evergreen_inputs(self, scholar_doc: Dict[str, Any], focus: str, max_context_chunks: int) -> Dict[str, Any]:
+        """What one evergreen story about a legend (as stored) is written
+        from: the legend restricted to its reviewed, creditable passages, the
+        reviewed page keys, the passages chosen for the focus, the allowed
+        source URLs and the writer's prompt. Makes no model call, so a dry
+        run measures the real prompt."""
+        reviewed = self._reviewed_page_keys(scholar_doc)
+        doc = self._with_creditable_passages(legend_identity.restricted_to_reviewed_sources(scholar_doc))
+        chunks = self._extract_context_chunks(scholar_doc=doc, topic=focus, max_context_chunks=max_context_chunks)
+        urls = self._evergreen_source_urls(chunks)
+        name = self._professor_name(scholar_doc)
+        return {
+            "doc": doc,
+            "reviewed_page_keys": reviewed,
+            "context_chunks": chunks,
+            "allowed_source_urls": urls,
+            "prompt": self._build_evergreen_prompt(name, focus, chunks, urls, self.assume_deceased),
+        }
+
+    def evergreen_gate(self, scholar_doc: Dict[str, Any]) -> Optional[str]:
+        """Why no story may be written about this legend now, or None: the
+        same gates as the nightly run (profile quality, when enforced, and a
+        current identity review that lets it be written about)."""
+        ready, status, score = self._profile_quality_state(scholar_doc)
+        if not ready:
+            return f"profile_quality_blocked:{status}:{score}"
+        identity_ok, identity_reason = legend_identity.story_eligibility(scholar_doc)
+        if not identity_ok:
+            return f"identity_blocked:{identity_reason}"
+        return None
+
+    def write_evergreen_slot(
+        self,
+        *,
+        scholar_doc: Dict[str, Any],
+        slot: int,
+        focus: str,
+        focus_source: str,
+        story_date: str,
+        run_id: str,
+        dry_run: bool,
+        max_context_chunks: int,
+        summary: Dict[str, int],
+        all_errors: List[str],
+    ) -> Optional[str]:
+        """Writes the legend's evergreen story for one slot, under its own
+        story key (EVERGREEN_SLOT_KEY), through the same checks, repairs and
+        record as every story. A slot already holding a story that did not
+        fail is left alone; a failed one is written again. Returns the stored
+        status, or None when nothing was stored (the reason is counted)."""
+        profile_id = self._profile_id(scholar_doc)
+        story_key = EVERGREEN_SLOT_KEY.format(profile_id=profile_id, slot=slot)
+        existing = self.stories_collection.find_one({"story_key": story_key}, {"_id": 1, "status": 1})
+        if existing:
+            if safe_text(existing.get("status")).lower() not in FAILED_STORY_STATUSES:
+                summary["skipped_existing"] += 1
+                return None
+            self.stories_collection.delete_one({"_id": existing["_id"]})
+
+        blocked = self.evergreen_gate(scholar_doc)
+        if blocked:
+            summary["skipped_identity" if blocked.startswith("identity_") else "skipped_profile_quality"] += 1
+            all_errors.append(f"{profile_id}:{blocked}")
+            return None
+
+        inputs = self.evergreen_inputs(scholar_doc, focus, max_context_chunks)
+        if len(inputs["context_chunks"]) < 4:
+            summary["failed_no_context"] += 1
+            all_errors.append(f"{profile_id}:insufficient_context")
+            return None
+        _, quality_status, quality_score = self._profile_quality_state(scholar_doc)
+        summary["evergreen"] += 1
+        return self._write_and_store(
+            profile_id=profile_id,
+            professor_name=self._professor_name(scholar_doc),
+            scholar_doc=inputs["doc"],
+            reviewed_page_keys=inputs["reviewed_page_keys"],
+            story_key=story_key,
+            story_date=story_date,
+            topic=focus,
+            topic_source=focus_source,
+            ml_topic_count=0,
+            context_chunks=inputs["context_chunks"],
+            style_profile=self._build_style_profile(inputs["doc"]),
+            trend_issue=None,
+            trend_relevance={},
+            mode=STORY_MODE_EVERGREEN,
+            dry_run=dry_run,
+            run_id=run_id,
+            force_regenerate=False,
+            existing_story=None,
+            existing_status="",
+            profile_quality=(quality_status, quality_score),
+            summary=summary,
+            all_errors=all_errors,
+            evergreen_slot=slot,
+        )
+
     def run(
         self,
         *,
@@ -6074,7 +7007,7 @@ Return only JSON.
                 "skipped_identity": 0,
                 "skipped_no_fresh_trend": 0,
                 "skipped_no_relevant_trend": 0,
-                "degraded_no_trend_data": 0,
+                "evergreen": 0,
                 "failed_no_trend_data": 0,
                 "failed_no_context": 0,
                 "failed_validation": 0,
@@ -6158,6 +7091,7 @@ Return only JSON.
                 summary["skipped_identity"] += 1
                 all_errors.append(f"{profile_id}:identity_blocked:{identity_reason}")
                 continue
+            reviewed_page_keys = self._reviewed_page_keys(scholar_doc)
             scholar_doc = legend_identity.restricted_to_reviewed_sources(scholar_doc)
 
             # With every event at its daily cap or already covered by this
@@ -6194,8 +7128,6 @@ Return only JSON.
                 all_errors.append(f"{profile_id}:insufficient_context")
                 continue
 
-            allowed_chunk_ids = {c["chunk_id"] for c in context_chunks}
-            disclosure = self._build_disclosure(professor_name, self.assume_deceased)
             style_profile = self._build_style_profile(scholar_doc)
             ranked_trends = self._rank_trending_issues(topic, trend_candidates)
             trend_issue, trend_relevance = self._choose_relevant_trend_issue(
@@ -6219,438 +7151,54 @@ Return only JSON.
             if trend_issue:
                 # The article itself, as the writer's grounding for the event.
                 trend_issue = self._with_article_text(trend_issue)
-            if self.strict_reliability and self.trends_enabled and not trend_issue:
-                if not self.allow_corpus_only_when_no_trend:
-                    summary["failed_no_trend_data"] += 1
-                    all_errors.append(f"{profile_id}:missing_trend_issue_for_reliable_mode")
+            if not trend_issue and self.strict_reliability and self.trends_enabled and not self.allow_corpus_only_when_no_trend:
+                summary["failed_no_trend_data"] += 1
+                all_errors.append(f"{profile_id}:missing_trend_issue_for_reliable_mode")
+                continue
+            # No news item: the legend's story is an evergreen one, a story in
+            # its own right (STORY_MODE_EVERGREEN), not a news article missing
+            # its event.
+            mode = STORY_MODE_NEWS if trend_issue else STORY_MODE_EVERGREEN
+            if mode == STORY_MODE_EVERGREEN:
+                summary["evergreen"] += 1
+                # The topic as a focus, not worded for the news.
+                framed = EVERGREEN_NEWS_TOPIC_FRAME.match(safe_text(topic))
+                topic = framed.group(1).strip() if framed else topic
+                # Only passages it can credit to a page.
+                context_chunks = self._extract_context_chunks(
+                    scholar_doc=self._with_creditable_passages(scholar_doc),
+                    topic=topic,
+                    max_context_chunks=max_context_chunks,
+                )
+                if len(context_chunks) < 4:
+                    summary["failed_no_context"] += 1
+                    all_errors.append(f"{profile_id}:insufficient_context")
                     continue
-                summary["degraded_no_trend_data"] += 1
-                all_errors.append(f"{profile_id}:missing_trend_issue_fallback_to_corpus_only")
-            allowed_source_urls = self._collect_allowed_source_urls(
+
+            self._write_and_store(
                 profile_id=profile_id,
+                professor_name=professor_name,
                 scholar_doc=scholar_doc,
-                trend_issue=trend_issue,
-            )
-
-            try:
-                payload = self._generate_story_payload(
-                    name=professor_name,
-                    topic=topic,
-                    trend_issue=trend_issue,
-                    style_profile=style_profile,
-                    context_chunks=context_chunks,
-                    allowed_source_urls=allowed_source_urls,
-                    assume_deceased=self.assume_deceased,
-                    dry_run=dry_run,
-                )
-            except Exception as exc:
-                summary["failed_generation"] += 1
-                all_errors.append(f"{profile_id}:generation_error:{exc}")
-                continue
-
-            payload, _ = self._enforce_source_url_citations(
-                payload=payload,
-                allowed_source_urls=allowed_source_urls,
-            )
-
-            valid, errors, warnings, used_chunk_ids, normalized_claim_map, trend_source_url = self._validate_story(
-                name=professor_name,
-                payload=payload,
+                reviewed_page_keys=reviewed_page_keys,
+                story_key=story_key,
+                story_date=story_date,
+                topic=topic,
+                topic_source=topic_source,
+                ml_topic_count=ml_topic_count,
                 context_chunks=context_chunks,
+                style_profile=style_profile,
                 trend_issue=trend_issue,
-                allowed_source_urls=allowed_source_urls,
-                allowed_chunk_ids=allowed_chunk_ids,
-                assume_deceased=self.assume_deceased,
+                trend_relevance=trend_relevance,
+                mode=mode,
+                dry_run=dry_run,
+                run_id=run_id,
+                force_regenerate=force_regenerate,
+                existing_story=existing_story,
+                existing_status=existing_status,
+                profile_quality=(profile_quality_status, profile_quality_score),
+                summary=summary,
+                all_errors=all_errors,
             )
-
-            if not valid:
-                patched_payload, patched = self._apply_reliability_fallbacks(
-                    payload=payload,
-                    name=professor_name,
-                    trend_issue=trend_issue,
-                    context_chunks=context_chunks,
-                    allowed_chunk_ids=allowed_chunk_ids,
-                )
-                if patched:
-                    patched_payload, _ = self._enforce_source_url_citations(
-                        payload=patched_payload,
-                        allowed_source_urls=allowed_source_urls,
-                    )
-                    (
-                        p_valid,
-                        p_errors,
-                        p_warnings,
-                        p_used_chunk_ids,
-                        p_claim_map,
-                        p_trend_source_url,
-                    ) = self._validate_story(
-                        name=professor_name,
-                        payload=patched_payload,
-                        context_chunks=context_chunks,
-                        trend_issue=trend_issue,
-                        allowed_source_urls=allowed_source_urls,
-                        allowed_chunk_ids=allowed_chunk_ids,
-                        assume_deceased=self.assume_deceased,
-                    )
-                    if p_valid or len(p_errors) < len(errors):
-                        payload = patched_payload
-                        valid = p_valid
-                        errors = p_errors
-                        warnings = p_warnings
-                        used_chunk_ids = p_used_chunk_ids
-                        normalized_claim_map = p_claim_map
-                        trend_source_url = p_trend_source_url
-                        notes = payload.get("editor_notes")
-                        if not isinstance(notes, list):
-                            notes = []
-                        notes.append("deterministic_reliability_patch")
-                        payload["editor_notes"] = notes
-
-            # Sections failing only for want of a grounded citation are
-            # rewritten on their own first (SECTION_CITATION_ERROR_PREFIXES).
-            if (not valid) and self.use_llm and (not dry_run) and self._sections_failing_citations(errors):
-                try:
-                    section_payload = self._repair_section_citations(
-                        name=professor_name,
-                        payload=payload,
-                        errors=errors,
-                        context_chunks=context_chunks,
-                        trend_issue=trend_issue,
-                    )
-                except Exception:
-                    section_payload = None
-                    warnings.append("section_repair_failed")
-                if section_payload:
-                    section_payload, _ = self._enforce_source_url_citations(
-                        payload=section_payload,
-                        allowed_source_urls=allowed_source_urls,
-                    )
-                    (
-                        s_valid,
-                        s_errors,
-                        s_warnings,
-                        s_used_chunk_ids,
-                        s_claim_map,
-                        s_trend_source_url,
-                    ) = self._validate_story(
-                        name=professor_name,
-                        payload=section_payload,
-                        context_chunks=context_chunks,
-                        trend_issue=trend_issue,
-                        allowed_source_urls=allowed_source_urls,
-                        allowed_chunk_ids=allowed_chunk_ids,
-                        assume_deceased=self.assume_deceased,
-                    )
-                    if s_valid or len(s_errors) < len(errors):
-                        payload = section_payload
-                        valid = s_valid
-                        errors = s_errors
-                        warnings = s_warnings
-                        used_chunk_ids = s_used_chunk_ids
-                        normalized_claim_map = s_claim_map
-                        trend_source_url = s_trend_source_url
-                        notes = payload.get("editor_notes")
-                        if not isinstance(notes, list):
-                            notes = []
-                        notes.append("section_citation_repair")
-                        payload["editor_notes"] = notes
-
-            if (not valid) and self.use_llm and (not dry_run):
-                repair_candidates = [
-                    err for err in errors
-                    if (
-                        err.startswith("persona_violation")
-                        or err.startswith("byline_impersonation")
-                        or err.startswith("byline_impersonation_payload_field")
-                        or err.startswith("unknown_inline_citations")
-                        or err.startswith("unknown_used_chunk_ids")
-                        or err.startswith("claim_map_")
-                        or err.startswith("section_missing_citation")
-                        or err.startswith("section_citation_end_loaded")
-                        or err.startswith("section_weak_citation_grounding")
-                        or err.startswith("section_missing_early_strong_citation")
-                        or err.startswith("section_unknown_or_missing_citations")
-                        or err.startswith("weak_paragraph_grounding")
-                        or err.startswith("unknown_article_urls")
-                        or err.startswith("article_word_count_below_minimum")
-                        or err.startswith("missing_required_section")
-                        or err.startswith("underdeveloped_sections")
-                        or err.startswith("single_paragraph_sections")
-                        or err in {
-                            "insufficient_inline_citations",
-                            "article_too_short",
-                            "insufficient_scholar_specific_grounding",
-                            "insufficient_concrete_details",
-                            "insufficient_major_sections",
-                            "missing_sources_section",
-                            "insufficient_claim_evidence_map_items",
-                            "claim_evidence_map_below_minimum_after_normalization",
-                            "missing_or_invalid_trend_source_url",
-                            "trend_source_url_mismatch",
-                            "source_urls_not_in_allowed_pool",
-                            "insufficient_source_url_citations",
-                            "source_url_missing_from_sources_section",
-                            "causal_claim_publications_only_evidence",
-                            "causal_paragraph_publications_only_evidence",
-                            "causal_claim_missing_valid_citation",
-                        }
-                    )
-                ]
-                if repair_candidates:
-                    try:
-                        repaired_payload = self._repair_story_payload(
-                            name=professor_name,
-                            topic=topic,
-                            trend_issue=trend_issue,
-                            style_profile=style_profile,
-                            context_chunks=context_chunks,
-                            allowed_source_urls=allowed_source_urls,
-                            assume_deceased=self.assume_deceased,
-                            failed_payload=payload,
-                            validation_errors=errors,
-                        )
-                        repaired_payload, _ = self._enforce_source_url_citations(
-                            payload=repaired_payload,
-                            allowed_source_urls=allowed_source_urls,
-                        )
-                        (
-                            r_valid,
-                            r_errors,
-                            r_warnings,
-                            r_used_chunk_ids,
-                            r_claim_map,
-                            r_trend_source_url,
-                        ) = self._validate_story(
-                            name=professor_name,
-                            payload=repaired_payload,
-                            context_chunks=context_chunks,
-                            trend_issue=trend_issue,
-                            allowed_source_urls=allowed_source_urls,
-                            allowed_chunk_ids=allowed_chunk_ids,
-                            assume_deceased=self.assume_deceased,
-                        )
-                        if r_valid or len(r_errors) < len(errors):
-                            payload = repaired_payload
-                            valid = r_valid
-                            errors = r_errors
-                            warnings = r_warnings
-                            used_chunk_ids = r_used_chunk_ids
-                            normalized_claim_map = r_claim_map
-                            trend_source_url = r_trend_source_url
-                            notes = payload.get("editor_notes")
-                            if not isinstance(notes, list):
-                                notes = []
-                            notes.append("auto_repair_pass")
-                            payload["editor_notes"] = notes
-                    except Exception:
-                        warnings.append("auto_repair_failed")
-
-            if not valid and (not self.strict_llm_only):
-                strict_fallback_payload = self._build_strict_validation_fallback_payload(
-                    name=professor_name,
-                    topic=topic,
-                    trend_issue=trend_issue,
-                    context_chunks=context_chunks,
-                    allowed_source_urls=allowed_source_urls,
-                    note=f"strict_fallback_after_errors:{'|'.join(errors)[:300]}",
-                )
-                strict_fallback_payload, _ = self._enforce_source_url_citations(
-                    payload=strict_fallback_payload,
-                    allowed_source_urls=allowed_source_urls,
-                )
-                (
-                    sf_valid,
-                    sf_errors,
-                    sf_warnings,
-                    sf_used_chunk_ids,
-                    sf_claim_map,
-                    sf_trend_source_url,
-                ) = self._validate_story(
-                    name=professor_name,
-                    payload=strict_fallback_payload,
-                    context_chunks=context_chunks,
-                    trend_issue=trend_issue,
-                    allowed_source_urls=allowed_source_urls,
-                    allowed_chunk_ids=allowed_chunk_ids,
-                    assume_deceased=self.assume_deceased,
-                )
-                if sf_valid or len(sf_errors) < len(errors):
-                    payload = strict_fallback_payload
-                    valid = sf_valid
-                    errors = sf_errors
-                    warnings = sf_warnings
-                    used_chunk_ids = sf_used_chunk_ids
-                    normalized_claim_map = sf_claim_map
-                    trend_source_url = sf_trend_source_url
-                    notes = payload.get("editor_notes")
-                    if not isinstance(notes, list):
-                        notes = []
-                    notes.append("strict_validation_fallback_pass")
-                    payload["editor_notes"] = notes
-
-            # A template is not an article. The two fallbacks above write fixed
-            # prose around the headline: one when the model gave nothing usable,
-            # one when its draft failed validation. Sent to review as finished
-            # stories, 29 of the first 30 legend drafts in the queue were
-            # templates (2026-10-29: the model call had been refused with a 403),
-            # and the admin pipeline rated them "every check passed". A template
-            # now fails, so the retry stage writes the story again.
-            template_error = template_failure(payload.get("editor_notes"), dry_run=dry_run)
-            if template_error:
-                valid = False
-                errors = [*errors, template_error]
-
-            status = "pending_review" if self.require_human_review else "generated"
-            if not valid:
-                status = "failed_validation"
-                summary["failed_validation"] += 1
-                all_errors.append(f"{profile_id}:failed_validation:{'|'.join(errors)}")
-
-            article_markdown = safe_text(payload.get("article_markdown"))
-            reader_article_markdown = self._sanitize_reader_article_markdown(article_markdown)
-            if reader_article_markdown != article_markdown:
-                notes = payload.get("editor_notes")
-                if not isinstance(notes, list):
-                    notes = []
-                notes.append("reader_sanitized")
-                payload["editor_notes"] = list(dict.fromkeys([safe_text(n) for n in notes if safe_text(n)]))
-            article_markdown = reader_article_markdown
-            if disclosure not in article_markdown:
-                article_markdown = f"> {disclosure}\n\n{article_markdown}"
-            selected_source_urls = payload.get("source_urls")
-            if not isinstance(selected_source_urls, list):
-                selected_source_urls = []
-            selected_source_urls = [safe_text(u) for u in selected_source_urls if safe_text(u)]
-
-            used_context = [c for c in context_chunks if c["chunk_id"] in set(used_chunk_ids)]
-            if not used_context:
-                used_context = context_chunks[:4]
-            sentence_source_map = self._build_sentence_source_map(
-                article_markdown=article_markdown,
-                context_chunks=context_chunks,
-                allowed_chunk_ids=allowed_chunk_ids,
-                fallback_source_urls=selected_source_urls,
-            )
-
-            story_doc = {
-                "story_key": story_key,
-                "story_date": story_date,
-                "status": status,
-                "topic": topic,
-                "topic_selection": {
-                    "source": topic_source,
-                    "ml_topic_candidates_count": ml_topic_count,
-                },
-                "topic_modeling": {
-                    "primary_model": "nmf",
-                    "selection_mode": "seeded_weighted_random_daily",
-                },
-                "scholar": {
-                    "profile_id": profile_id,
-                    "name": professor_name,
-                    "profile_quality": {
-                        "status": profile_quality_status,
-                        "score": profile_quality_score,
-                        "enforced": self.enforce_profile_quality,
-                    },
-                },
-                "trend_issue": {
-                    "enabled": self.trends_enabled,
-                    "provider": self.trend_provider,
-                    "selected": trend_issue or {},
-                    "verified_source_url": trend_source_url,
-                    "relevance": trend_relevance,
-                },
-                "style_profile": style_profile,
-                "content": {
-                    "title": safe_text(payload.get("title")),
-                    "standfirst": safe_text(payload.get("standfirst")),
-                    "article_markdown": article_markdown,
-                    "disclosure": disclosure,
-                    "source_urls": selected_source_urls,
-                },
-                "presentation": {
-                    "allow_scholar_byline": False,
-                    "author_label": "AI-generated perspective",
-                },
-                "citations": [
-                    {
-                        "chunk_id": c["chunk_id"],
-                        "section": c["section"],
-                        "evidence_excerpt": c["text"][:350],
-                        "source_urls": self._chunk_source_urls(c),
-                        "source_refs": (c.get("source_refs") if isinstance(c.get("source_refs"), list) else [])[:3],
-                    }
-                    for c in used_context
-                ],
-                "source_url_citations": [{"url": u} for u in selected_source_urls],
-                "sentence_source_map": sentence_source_map,
-                "generation": {
-                    "mode": "dry_run" if dry_run or not self.use_llm else "llm",
-                    "model": "none" if dry_run or not self.use_llm else self.model_name,
-                    "generated_at": utc_now_iso(),
-                    "run_id": run_id,
-                    "editor_notes": payload.get("editor_notes") or [],
-                },
-                "claim_evidence_map": normalized_claim_map,
-                "ml_retrieval": {
-                    "strategy": "hybrid_dense_lexical_section_prior",
-                    "embedding_model": self.embedding_model_name if self.ml_enabled else "disabled",
-                    "cross_encoder_reranker": {
-                        "enabled": bool(self.cross_encoder_enabled and self.ml_enabled),
-                        "active": bool(self.cross_encoder_enabled and self.ml_enabled and not self._cross_encoder_unavailable),
-                        "model": self.cross_encoder_model_name if self.cross_encoder_enabled else "disabled",
-                        "top_k": self.cross_encoder_rerank_top_k if self.cross_encoder_enabled else 0,
-                        "weight": self.cross_encoder_weight if self.cross_encoder_enabled else 0.0,
-                    },
-                    "topic_tokens_used": self._topic_tokens(topic),
-                    "trend_tokens_used": self._topic_tokens(safe_text((trend_issue or {}).get("title"))),
-                },
-                "safety": {
-                    "assume_deceased": self.assume_deceased,
-                    "require_human_review": self.require_human_review,
-                    "strict_reliability": self.strict_reliability,
-                    "enforce_source_url_citations": self.enforce_source_url_citations,
-                    "validation_passed": valid,
-                    "errors": errors,
-                    "warnings": warnings,
-                },
-            }
-
-            if force_regenerate and existing_story and existing_status != "failed_validation":
-                if valid:
-                    self.stories_collection.replace_one(
-                        {"_id": existing_story["_id"]},
-                        story_doc,
-                    )
-                    summary["generated"] += 1
-                else:
-                    all_errors.append(f"{profile_id}:regeneration_rejected_existing_story_retained")
-                continue
-
-            try:
-                self.stories_collection.insert_one(story_doc)
-                if valid:
-                    summary["generated"] += 1
-            except Exception as exc:
-                is_duplicate = bool(DuplicateKeyError is not None and isinstance(exc, DuplicateKeyError))
-                if is_duplicate:
-                    try:
-                        self.stories_collection.replace_one(
-                            {"story_key": story_key},
-                            story_doc,
-                            upsert=True,
-                        )
-                        if valid:
-                            summary["generated"] += 1
-                        continue
-                    except Exception as replace_exc:
-                        summary["failed_generation"] += 1
-                        all_errors.append(f"{profile_id}:replace_error:{replace_exc}")
-                        continue
-                summary["failed_generation"] += 1
-                all_errors.append(f"{profile_id}:insert_error:{exc}")
-                continue
 
         final_status = "completed"
         if summary["generated"] == 0 and summary["failed_validation"] > 0:

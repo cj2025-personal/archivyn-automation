@@ -15,6 +15,17 @@ from daily_story_worker import DailyStoryWorker, parse_date, safe_text, utc_now_
 
 
 DEFAULT_RETRY_STATUSES = ["failed_validation", "failed_generation"]
+# What one evergreen slot's retry counts (DailyStoryWorker.write_evergreen_slot).
+SLOT_SUMMARY_KEYS = (
+    "generated",
+    "skipped_existing",
+    "skipped_identity",
+    "skipped_profile_quality",
+    "failed_no_context",
+    "failed_validation",
+    "failed_generation",
+    "evergreen",
+)
 
 
 def run_retry_failed(
@@ -81,6 +92,35 @@ def run_retry_failed(
                 continue
 
             topic_override = safe_text(failed.get("topic")) if reuse_topic else None
+
+            # An evergreen story written for a chosen list of legends
+            # (legend_evergreen) holds its own slot: it is written again in
+            # that slot, on the same focus, not replaced by a night's story.
+            evergreen = failed.get("evergreen") if isinstance(failed.get("evergreen"), dict) else {}
+            if evergreen.get("slot"):
+                scholar_doc = worker.scholars_collection.find_one({"profile_id": profile_id})
+                summary["retried"] += 1
+                slot_summary = {key: 0 for key in SLOT_SUMMARY_KEYS}
+                slot_errors: List[str] = []
+                if scholar_doc:
+                    worker.write_evergreen_slot(
+                        scholar_doc=scholar_doc,
+                        slot=int(evergreen["slot"]),
+                        focus=safe_text(evergreen.get("focus")) or safe_text(failed.get("topic")),
+                        focus_source=safe_text((failed.get("topic_selection") or {}).get("source")) or "retry",
+                        story_date=story_date,
+                        run_id=run_id,
+                        dry_run=dry_run,
+                        max_context_chunks=max_context_chunks,
+                        summary=slot_summary,
+                        all_errors=slot_errors,
+                    )
+                if slot_summary["generated"] > 0:
+                    summary["regenerated"] += 1
+                else:
+                    summary["still_failed"] += 1
+                    errors.extend(slot_errors or [f"{profile_id}:retry_not_generated"])
+                continue
 
             # Remove failed row to unblock unique story_key before retry.
             worker.stories_collection.delete_one({"story_key": story_key})
