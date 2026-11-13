@@ -7,8 +7,8 @@ pick is theirs and quick:
 
 - sources: the passages of pages the identity review ruled about the legend
   (legend_identity), how many, from how many pages, with a link to credit;
-- licences: how much of that comes from pages whose terms are known to allow
-  use with credit (source_licences: an open licence, or a US federal work);
+- licenses: how much of that comes from pages whose terms are known to allow
+  use with credit (source_licenses: an open license, or a US federal work);
 - writable now: the same gates the story writer applies (identity review
   current and eligible, the profile-quality gate, at least four passages to
   write from);
@@ -53,7 +53,7 @@ from daily_story_personalize import readability_metrics
 from daily_story_worker import creditable_source
 from legend_child_bio import BIO_BAND, learner_api_fk_grade
 from readonly_mongo import connect_read_only
-from source_licences import OPEN, REFUSED, licence_for
+from source_licenses import OPEN, REFUSED, license_for
 
 URI_ENV = "LEGEND_REPORT_MONGO_URI"
 DB_ENV = "LEGEND_REPORT_DB"
@@ -72,7 +72,7 @@ FULL_PAGES = 6
 SCORE_WEIGHTS = {
     "depth": 0.30,
     "pages": 0.15,
-    "open_licence": 0.20,
+    "open_license": 0.20,
     "ruled_suitable": 0.25,
     "versions_ready": 0.10,
 }
@@ -96,14 +96,14 @@ def cleared_for_learners(story: Dict[str, Any]) -> bool:
 
 
 def source_signals(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """The legend's reviewed passages: counts, pages, sections, licences."""
+    """The legend's reviewed passages: counts, pages, sections, licenses."""
     restricted = legend_identity.restricted_to_reviewed_sources(doc)
     sections = _obj(_obj(restricted.get("rag_context")).get("section_chunks"))
     passages = 0
     creditable = 0
     chars = 0
     pages: Dict[str, Dict[str, Any]] = {}
-    by_licence: Counter = Counter()
+    by_license: Counter = Counter()
     for section, chunks in sections.items():
         for chunk in chunks if isinstance(chunks, list) else []:
             text = legend_identity.chunk_text(chunk)
@@ -114,27 +114,27 @@ def source_signals(doc: Dict[str, Any]) -> Dict[str, Any]:
             links = legend_identity.chunk_links(chunk)
             if not links or not creditable_source(links[0]):
                 # Nothing the writer may cite and credit (daily_story_worker.creditable_source).
-                by_licence["no_link" if not links else "not_creditable"] += 1
+                by_license["no_link" if not links else "not_creditable"] += 1
                 continue
             creditable += 1
             key = legend_identity.chunk_page_key(chunk)
             if key not in pages:
-                pages[key] = {"licence": licence_for(links[0]), "passages": 0}
+                pages[key] = {"license": license_for(links[0]), "passages": 0}
             pages[key]["passages"] += 1
-            by_licence[pages[key]["licence"]["status"]] += 1
-    licences = Counter()
+            by_license[pages[key]["license"]["status"]] += 1
+    licenses = Counter()
     for page in pages.values():
-        licences[page["licence"]["name"]] += page["passages"]
+        licenses[page["license"]["name"]] += page["passages"]
     return {
         "passages": passages,
         "creditable_passages": creditable,
         "chars": chars,
         "pages": len(pages),
         "sections": sorted(sections),
-        "passages_by_licence_status": dict(by_licence),
-        "open_share": round(by_licence[OPEN] / creditable, 3) if creditable else 0.0,
-        "refused_passages": by_licence[REFUSED],
-        "top_licences": licences.most_common(3),
+        "passages_by_license_status": dict(by_license),
+        "open_share": round(by_license[OPEN] / creditable, 3) if creditable else 0.0,
+        "refused_passages": by_license[REFUSED],
+        "top_licenses": licenses.most_common(3),
     }
 
 
@@ -192,7 +192,7 @@ def score(sources: Dict[str, Any], stories: Dict[str, Any]) -> Dict[str, float]:
     parts = {
         "depth": min(1.0, math.log1p(sources["creditable_passages"]) / math.log1p(FULL_DEPTH_PASSAGES)),
         "pages": min(1.0, sources["pages"] / FULL_PAGES),
-        "open_licence": sources["open_share"],
+        "open_license": sources["open_share"],
         "ruled_suitable": (ruled["suitable"] + 1) / (judged + 2),
         "versions_ready": (stories["versions"]["ready"] + 1) / (written + 2),
     }
@@ -217,7 +217,7 @@ def blockers(doc: Dict[str, Any], sources: Dict[str, Any], quality: Dict[str, An
 
 def reasons_line(row: Dict[str, Any]) -> str:
     s, t = row["sources"], row["stories"]
-    licences = ", ".join(f"{name} {n}" for name, n in s["top_licences"]) or "none"
+    licenses = ", ".join(f"{name} {n}" for name, n in s["top_licenses"]) or "none"
     ruled = t["ruled"][BAND]
     younger = t["ruled"][YOUNGER_BAND]
     if ruled["suitable"] + ruled["not_suitable"]:
@@ -230,7 +230,7 @@ def reasons_line(row: Dict[str, Any]) -> str:
     bio_text = f"adult bio grade {bio['fk_grade']}" if bio["fk_grade"] is not None else "no adult bio"
     bio_text += "; grade 3-5 bio stored" if bio["child_bio"] else "; no grade 3-5 bio"
     lines = [
-        f"{s['creditable_passages']} reviewed passages from {s['pages']} pages ({round(100 * s['open_share'])}% open-licensed; by licence: {licences})",
+        f"{s['creditable_passages']} reviewed passages from {s['pages']} pages ({round(100 * s['open_share'])}% open-licensed; by license: {licenses})",
         f"{ruling}; versions {t['versions']['ready']} ready, {t['versions']['failed']} failed, {t['versions']['not_suitable']} not suitable; {t['servable']} servable now",
         f"profile quality {row['quality']['status']} {row['quality']['score']}; stories {t['stories']} ({t['cleared']} approved, {t['on_legal_hold']} on legal hold, {t['evergreen']} evergreen); {bio_text}",
     ]

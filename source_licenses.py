@@ -8,7 +8,7 @@ not the same as refused. Refused hosts are the publishers the story worker
 already keeps out (daily_story_worker.EXCLUDED_PUBLISHER_DOMAINS), whose
 terms forbid this use.
 
-The table is pilot plan B4's starting point (an allowlist with the licence
+The table is pilot plan B4's starting point (an allowlist with the license
 per domain), not a legal opinion: counsel signs off on it. Change the table
 to change what every story's source record and the selection report say.
 """
@@ -17,9 +17,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
-LICENCE_POLICY_VERSION = "source-licences-2026-11-12"
+LICENSE_POLICY_VERSION = "source-licenses-2026-11-12"
 
-OPEN = "open"          # an open licence, or the site's own text is in the public domain
+OPEN = "open"          # an open license, or the site's own text is in the public domain
 UNKNOWN = "unknown"    # the site's terms have not been checked
 REFUSED = "refused"    # the site's terms forbid this use
 
@@ -32,14 +32,14 @@ _US_FEDERAL = {
     "attribution": "Credit the agency and link the page; material the agency hosts from others keeps its own terms.",
 }
 
-# (host suffix, licence). The first suffix that matches wins, so list more
+# (host suffix, license). The first suffix that matches wins, so list more
 # specific hosts first.
 KNOWN_HOSTS: List[Tuple[str, Dict[str, str]]] = [
     ("wikipedia.org", {
         "id": "CC-BY-SA-4.0",
         "name": "Creative Commons Attribution-ShareAlike 4.0 (Wikipedia text)",
         "status": OPEN,
-        "attribution": "Name the article and Wikipedia, link it and the licence; an adaptation is shared under the same licence.",
+        "attribution": "Name the article and Wikipedia, link it and the license; an adaptation is shared under the same license.",
     }),
     ("wikidata.org", {
         "id": "CC0-1.0",
@@ -51,7 +51,7 @@ KNOWN_HOSTS: List[Tuple[str, Dict[str, str]]] = [
         "id": "CC-BY-3.0",
         "name": "Creative Commons Attribution 3.0 (Global Voices)",
         "status": OPEN,
-        "attribution": "Name Global Voices and the author, link the page and the licence.",
+        "attribution": "Name Global Voices and the author, link the page and the license.",
     }),
     *[(host, _US_FEDERAL) for host in (
         "loc.gov",
@@ -93,8 +93,8 @@ def _matches(host: str, suffix: str) -> bool:
     return host == suffix or host.endswith("." + suffix)
 
 
-def licence_for(url: Any) -> Dict[str, str]:
-    """The licence record for a page: its id, name, status (open, unknown,
+def license_for(url: Any) -> Dict[str, str]:
+    """The license record for a page: its id, name, status (open, unknown,
     refused), what crediting it takes, the host and this table's version."""
     host = host_of(url)
     # Imported here: the worker imports this module.
@@ -108,5 +108,5 @@ def licence_for(url: Any) -> Dict[str, str]:
             "attribution": "Not used.",
         }
     else:
-        found = next((licence for suffix, licence in KNOWN_HOSTS if host and _matches(host, suffix)), _UNKNOWN)
-    return {**found, "host": host, "policy_version": LICENCE_POLICY_VERSION}
+        found = next((license for suffix, license in KNOWN_HOSTS if host and _matches(host, suffix)), _UNKNOWN)
+    return {**found, "host": host, "policy_version": LICENSE_POLICY_VERSION}

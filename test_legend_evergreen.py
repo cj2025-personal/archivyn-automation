@@ -28,7 +28,7 @@ import legend_child_bio as bios
 import legend_evergreen as evergreen
 import legend_selection_report as selection
 import model_costs
-import source_licences
+import source_licenses
 from readonly_mongo import ReadOnlyCollection, ReadOnlyDatabase, ReadOnlyViolation, write_stage_in
 from test_editorial_pipeline import _identified
 
@@ -204,15 +204,15 @@ class ReadOnlyWrapperTests(unittest.TestCase):
                 getattr(db, method)
 
 
-class SourceLicenceTests(unittest.TestCase):
+class SourceLicenseTests(unittest.TestCase):
     def test_what_is_known_about_a_page_s_terms(self) -> None:
-        self.assertEqual(source_licences.licence_for("https://en.wikipedia.org/wiki/X")["id"], "CC-BY-SA-4.0")
-        self.assertEqual(source_licences.licence_for("https://www.nasa.gov/people/x")["status"], source_licences.OPEN)
-        self.assertEqual(source_licences.licence_for("https://www.nytimes.com/2026/a.html")["status"], source_licences.REFUSED)
-        unknown = source_licences.licence_for("https://library.example.edu/x")
-        self.assertEqual(unknown["status"], source_licences.UNKNOWN, "not checked is not the same as refused")
+        self.assertEqual(source_licenses.license_for("https://en.wikipedia.org/wiki/X")["id"], "CC-BY-SA-4.0")
+        self.assertEqual(source_licenses.license_for("https://www.nasa.gov/people/x")["status"], source_licenses.OPEN)
+        self.assertEqual(source_licenses.license_for("https://www.nytimes.com/2026/a.html")["status"], source_licenses.REFUSED)
+        unknown = source_licenses.license_for("https://library.example.edu/x")
+        self.assertEqual(unknown["status"], source_licenses.UNKNOWN, "not checked is not the same as refused")
         self.assertEqual(unknown["host"], "library.example.edu")
-        self.assertEqual(source_licences.licence_for("https://fakewikipedia.org.evil.com/x")["status"], source_licences.UNKNOWN)
+        self.assertEqual(source_licenses.license_for("https://fakewikipedia.org.evil.com/x")["status"], source_licenses.UNKNOWN)
 
     def test_only_a_page_fit_to_credit_is_cited(self) -> None:
         credit = worker_module.creditable_source
@@ -433,7 +433,7 @@ class EvergreenWritingTests(unittest.TestCase):
             self.assertTrue(record["all_allowed"])
             self.assertTrue(record["all_cited_attributed"])
             self.assertIsNone(record["news_item"])
-            by_host = {row["licence"]["host"]: row["licence"]["status"] for row in record["pages"]}
+            by_host = {row["license"]["host"]: row["license"]["status"] for row in record["pages"]}
             self.assertEqual(by_host["en.wikipedia.org"], "open")
             self.assertEqual(by_host["library.example.edu"], "unknown")
             for row in record["pages"]:

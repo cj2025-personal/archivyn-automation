@@ -48,7 +48,7 @@ from config.mongodb_utils import create_mongo_client, resolve_mongo_db_name
 from enrichment.crawl_policy import SYNC_ROBOTS, USER_AGENT, is_challenge_page
 import legend_identity
 from readonly_mongo import ReadOnlyDatabase
-from source_licences import LICENCE_POLICY_VERSION, OPEN, REFUSED, licence_for
+from source_licenses import LICENSE_POLICY_VERSION, OPEN, REFUSED, license_for
 
 try:
     from pymongo.errors import DuplicateKeyError
@@ -6367,14 +6367,14 @@ Return only JSON.
         """What an evergreen story was written from, page by page: whether the
         page is allowed (its identity review ruled it about the legend, and
         its publisher's terms are not known to forbid this use), whether the
-        story credits it (listed under Sources), and its licence as far as it
-        is known (source_licences)."""
+        story credits it (listed under Sources), and its license as far as it
+        is known (source_licenses)."""
         pages: Dict[str, Dict[str, Any]] = {}
 
         def page_for(url: str) -> Dict[str, Any]:
             key = legend_identity.page_key(url)
             if key not in pages:
-                licence = licence_for(url)
+                license = license_for(url)
                 pages[key] = {
                     "url": url,
                     "page_key": key,
@@ -6382,8 +6382,8 @@ Return only JSON.
                     "cited": False,
                     "listed": False,
                     "reviewed": key in reviewed_page_keys,
-                    "licence": licence,
-                    "allowed": key in reviewed_page_keys and licence["status"] != REFUSED,
+                    "license": license,
+                    "allowed": key in reviewed_page_keys and license["status"] != REFUSED,
                 }
             return pages[key]
 
@@ -6403,13 +6403,13 @@ Return only JSON.
         rows = list(pages.values())
         return {
             "policy_version": EVERGREEN_POLICY_VERSION,
-            "licence_policy_version": LICENCE_POLICY_VERSION,
+            "license_policy_version": LICENSE_POLICY_VERSION,
             "news_item": None,
             "pages": rows,
             "all_allowed": all(row["allowed"] for row in rows),
             "all_cited_attributed": all(row["listed"] for row in rows if row["cited"]),
-            "open_licence_pages": sum(1 for row in rows if row["licence"]["status"] == OPEN),
-            "unknown_licence_pages": sum(1 for row in rows if row["licence"]["status"] not in (OPEN, REFUSED)),
+            "open_license_pages": sum(1 for row in rows if row["license"]["status"] == OPEN),
+            "unknown_license_pages": sum(1 for row in rows if row["license"]["status"] not in (OPEN, REFUSED)),
         }
 
     @staticmethod
@@ -6824,7 +6824,7 @@ Return only JSON.
 
     def evergreen_focus_pool(self, scholar_doc: Dict[str, Any]) -> List[Tuple[str, str]]:
         """The distinct focuses a legend's evergreen stories can take, in a
-        fixed order, as (focus, how it was found): the corpus's modelled
+        fixed order, as (focus, how it was found): the corpus's modeled
         topics, then its mined phrases, then its passage sections. Slot n of a
         legend's evergreen stories takes the nth, so each story is on a
         different part of the legend's work and a repeated run picks the same
