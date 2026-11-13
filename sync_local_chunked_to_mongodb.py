@@ -16,7 +16,7 @@ import json
 import time
 import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -31,16 +31,24 @@ class LocalChunkedMongoSync:
         collection_name: str = "legend_scholars",
         use_llm: bool = True,
         scholar_type: Optional[str] = None,
+        database: Any = None,
     ):
-        load_dotenv(dotenv_path=".env")
+        # A caller that hands in its database (legend_profile_repair.py names
+        # its own) loads no .env: in a working copy that file points at
+        # production.
+        if database is not None:
+            self.mongo_client = None
+            self.db = database
+        else:
+            load_dotenv(dotenv_path=".env")
 
-        mongodb_uri = os.getenv("MONGODB_URI")
-        if not mongodb_uri:
-            raise ValueError("MONGODB_URI not found in environment variables")
+            mongodb_uri = os.getenv("MONGODB_URI")
+            if not mongodb_uri:
+                raise ValueError("MONGODB_URI not found in environment variables")
 
-        self.mongo_client = create_mongo_client(mongodb_uri)
-        db_name = resolve_mongo_db_name(mongodb_uri)
-        self.db = self.mongo_client[db_name]
+            self.mongo_client = create_mongo_client(mongodb_uri)
+            db_name = resolve_mongo_db_name(mongodb_uri)
+            self.db = self.mongo_client[db_name]
         self.collection = self.db[collection_name]
         self.collection_name = collection_name
         self.use_llm = use_llm
@@ -646,39 +654,51 @@ Return JSON:
                     return candidate
         return ""
 
+    def build_document(self, chunks_path: Path, profiles_root: Optional[Path]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """(profile_id, the document sync_chunks_file stores) for one run's
+        chunks.json, or None when it has no sections. Writes nothing:
+        legend_profile_repair.py builds a candidate with it and stores only
+        its rag_context, and only once that passes the profile-quality gate."""
+        data = self._load_json(chunks_path)
+        profile_id = data.get("profile_id") or chunks_path.parent.name
+        sections = data.get("sections", {})
+        if not sections:
+            return None
+
+        professor_name = ""
+        if profiles_root:
+            profile_json = profiles_root / profile_id / f"{profile_id}.json"
+            if profile_json.exists():
+                prof_data = self._load_json(profile_json)
+                professor_name = (
+                    prof_data.get("name")
+                    or prof_data.get("professor_name")
+                    or ""
+                ).strip()
+
+        if not professor_name:
+            professor_name = self._extract_name_from_chunks_data(data)
+
+        if not professor_name:
+            professor_name = "Unknown"
+
+        source_payload = self._load_source_chunks_payload(profiles_root, profile_id)
+        document = self._create_scholar_document(
+            profile_id,
+            professor_name,
+            sections,
+            source_payload=source_payload,
+        )
+        return profile_id, document
+
     def sync_chunks_file(self, chunks_path: Path, profiles_root: Optional[Path]) -> bool:
         try:
-            data = self._load_json(chunks_path)
-            profile_id = data.get("profile_id") or chunks_path.parent.name
-            sections = data.get("sections", {})
-            if not sections:
+            built = self.build_document(chunks_path, profiles_root)
+            if built is None:
                 print(f"[Skip] No sections in {chunks_path}")
                 return False
-
-            professor_name = ""
-            if profiles_root:
-                profile_json = profiles_root / profile_id / f"{profile_id}.json"
-                if profile_json.exists():
-                    prof_data = self._load_json(profile_json)
-                    professor_name = (
-                        prof_data.get("name")
-                        or prof_data.get("professor_name")
-                        or ""
-                    ).strip()
-
-            if not professor_name:
-                professor_name = self._extract_name_from_chunks_data(data)
-
-            if not professor_name:
-                professor_name = "Unknown"
-
-            source_payload = self._load_source_chunks_payload(profiles_root, profile_id)
-            document = self._create_scholar_document(
-                profile_id,
-                professor_name,
-                sections,
-                source_payload=source_payload,
-            )
+            profile_id, document = built
+            professor_name = document["professor_name"]
             self.collection.update_one({"profile_id": profile_id}, {"$set": document}, upsert=True)
             print(f"[MongoDB] Upserted {professor_name} ({profile_id}) into {self.collection_name}")
             return True
@@ -696,7 +716,8 @@ Return JSON:
 
     def close(self) -> None:
         try:
-            self.mongo_client.close()
+            if self.mongo_client is not None:  # a database handed in is the caller's to close
+                self.mongo_client.close()
         except Exception:
             pass
         http_client = getattr(self, "http_client", None)

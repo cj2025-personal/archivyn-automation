@@ -82,7 +82,13 @@ EDITOR_PROMPT_CHARS = 3000 + STORY_CHARS + 8000 + 6000  # instructions, story, c
 
 def parse_ids(inline: str, path: str) -> List[str]:
     ids: List[str] = []
-    for chunk in [inline or ""] + ([open(path, encoding="utf-8").read()] if path else []):
+    # utf-8-sig: PowerShell 5.1's Set-Content -Encoding utf8 starts the file
+    # with a byte-order mark, which would otherwise become part of the first id.
+    from_file = ""
+    if path:
+        with open(path, encoding="utf-8-sig") as handle:
+            from_file = handle.read()
+    for chunk in [inline or "", from_file]:
         for raw in chunk.replace("\n", ",").split(","):
             text = raw.strip()
             if text and not text.startswith("#") and text not in ids:

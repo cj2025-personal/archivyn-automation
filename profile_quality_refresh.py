@@ -23,14 +23,52 @@ CORE_SECTIONS = [
     "publications",
 ]
 
+# The score's parts and the bars a profile must clear to be "ready". They are
+# named here, not written inline, so legend_profile_diagnosis.py can say what
+# a profile lacks from the very rules that score it.
+NAME_POINTS = 20
+# (at least this much, points), highest first.
+CHUNK_POINTS: Tuple[Tuple[int, int], ...] = ((80, 40), (40, 30), (20, 20), (10, 10))
+COVERAGE_POINTS: Tuple[Tuple[int, int], ...] = ((4, 20), (3, 14), (2, 8))
+AVG_LEN_POINTS: Tuple[Tuple[int, int], ...] = ((420, 20), (250, 14), (140, 8))
+READY_MIN_SCORE = 60
+READY_MIN_CHUNKS = 20
+
+
+def tier_points(value: float, tiers: Tuple[Tuple[int, int], ...]) -> int:
+    for floor, points in tiers:
+        if value >= floor:
+            return points
+    return 0
+
+
+def core_sections_found(sections: List[str]) -> List[str]:
+    """The CORE_SECTIONS named in any section title (a substring match)."""
+    lower_sections = [safe_text(s).lower() for s in sections]
+    return [core for core in CORE_SECTIONS if any(core in sec for sec in lower_sections)]
+
 
 def _section_coverage(sections: List[str]) -> int:
-    lower_sections = [safe_text(s).lower() for s in sections]
-    hits = 0
-    for core in CORE_SECTIONS:
-        if any(core in sec for sec in lower_sections):
-            hits += 1
-    return hits
+    return len(core_sections_found(sections))
+
+
+def score_points(*, name_quality: int, chunk_count: int, section_coverage: int, avg_chunk_len: float) -> Dict[str, int]:
+    """Each part of the score. avg_chunk_len is the unrounded mean: the
+    stored signal is rounded, and rounding can cross a bar."""
+    return {
+        "name": NAME_POINTS if name_quality else 0,
+        "chunks": tier_points(chunk_count, CHUNK_POINTS),
+        "coverage": tier_points(section_coverage, COVERAGE_POINTS),
+        "avg_len": tier_points(avg_chunk_len, AVG_LEN_POINTS),
+    }
+
+
+def status_for(*, score: int, chunk_count: int, profile_id: str) -> str:
+    if not profile_id:
+        return "invalid_profile"
+    if score < READY_MIN_SCORE or chunk_count < READY_MIN_CHUNKS:
+        return "needs_data_repair"
+    return "ready"
 
 
 def _avg_chunk_len(section_chunks: Dict[str, Any]) -> float:
@@ -70,39 +108,13 @@ def evaluate_profile(worker: DailyStoryWorker, scholar_doc: Dict[str, Any]) -> D
     chunk_count = int(rag_context.get("chunk_count") or 0)
     if chunk_count <= 0 and isinstance(section_chunks, dict):
         chunk_count = sum(len(v) for v in section_chunks.values() if isinstance(v, list))
-    coverage = _section_coverage(sections_available if isinstance(sections_available, list) else [])
+    sections = sections_available if isinstance(sections_available, list) else []
+    coverage = _section_coverage(sections)
     avg_len = _avg_chunk_len(section_chunks)
 
-    score = 0
-    score += 20 if name_quality else 0
-    if chunk_count >= 80:
-        score += 40
-    elif chunk_count >= 40:
-        score += 30
-    elif chunk_count >= 20:
-        score += 20
-    elif chunk_count >= 10:
-        score += 10
-
-    if coverage >= 4:
-        score += 20
-    elif coverage == 3:
-        score += 14
-    elif coverage == 2:
-        score += 8
-
-    if avg_len >= 420:
-        score += 20
-    elif avg_len >= 250:
-        score += 14
-    elif avg_len >= 140:
-        score += 8
-
-    status = "ready"
-    if score < 60 or chunk_count < 20:
-        status = "needs_data_repair"
-    if not profile_id:
-        status = "invalid_profile"
+    points = score_points(name_quality=name_quality, chunk_count=chunk_count, section_coverage=coverage, avg_chunk_len=avg_len)
+    score = sum(points.values())
+    status = status_for(score=score, chunk_count=chunk_count, profile_id=profile_id)
 
     return {
         "profile_id": profile_id,
@@ -116,7 +128,46 @@ def evaluate_profile(worker: DailyStoryWorker, scholar_doc: Dict[str, Any]) -> D
             "section_coverage": coverage,
             "avg_chunk_len": round(avg_len, 1),
         },
+        # Not stored (quality_record keeps the signals); for the diagnosis.
+        "points": points,
+        "core_sections": core_sections_found(sections),
     }
+
+
+def quality_record(result: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    """The daily_story_profile_quality row for one scored profile."""
+    return {
+        "profile_id": safe_text(result.get("profile_id")),
+        "name_raw": result["name_raw"],
+        "name_normalized": result["name_normalized"],
+        "quality_score": result["score"],
+        "status": safe_text(result.get("status")) or "invalid_profile",
+        "signals": result["signals"],
+        "run_id": run_id,
+        "refreshed_at": utc_now_iso(),
+    }
+
+
+def store_quality(quality_col: Any, scholars_col: Any, result: Dict[str, Any], *, run_id: str, update_scholar_docs: bool) -> None:
+    """Record a profile's score where the story gate reads it: the quality
+    row, and with update_scholar_docs the legend's own daily_story_profile
+    (which the gate reads first). Shared by the nightly refresh and
+    legend_profile_repair.py, so both label a profile the same way."""
+    record = quality_record(result, run_id)
+    profile_id = record["profile_id"]
+    quality_col.update_one({"profile_id": profile_id}, {"$set": record}, upsert=True)
+    if update_scholar_docs:
+        scholars_col.update_one(
+            {"profile_id": profile_id},
+            {
+                "$set": {
+                    "daily_story_profile.quality_score": result["score"],
+                    "daily_story_profile.status": record["status"],
+                    "daily_story_profile.name_normalized": result["name_normalized"],
+                    "daily_story_profile.refreshed_at": utc_now_iso(),
+                }
+            },
+        )
 
 
 def run_quality_refresh(*, max_scholars: int, scholar_id: str | None, update_scholar_docs: bool) -> Dict[str, Any]:
@@ -167,30 +218,13 @@ def run_quality_refresh(*, max_scholars: int, scholar_id: str | None, update_sch
                 errors.append("missing_profile_id")
                 continue
 
-            quality_doc = {
-                "profile_id": profile_id,
-                "name_raw": result["name_raw"],
-                "name_normalized": result["name_normalized"],
-                "quality_score": result["score"],
-                "status": status,
-                "signals": result["signals"],
-                "run_id": run_id,
-                "refreshed_at": utc_now_iso(),
-            }
-            quality_col.update_one({"profile_id": profile_id}, {"$set": quality_doc}, upsert=True)
-
-            if update_scholar_docs:
-                worker.scholars_collection.update_one(
-                    {"profile_id": profile_id},
-                    {
-                        "$set": {
-                            "daily_story_profile.quality_score": result["score"],
-                            "daily_story_profile.status": status,
-                            "daily_story_profile.name_normalized": result["name_normalized"],
-                            "daily_story_profile.refreshed_at": utc_now_iso(),
-                        }
-                    },
-                )
+            store_quality(
+                quality_col,
+                worker.scholars_collection,
+                result,
+                run_id=run_id,
+                update_scholar_docs=update_scholar_docs,
+            )
 
         final_status = "completed" if summary.get("attempted", 0) > 0 else "completed_no_data"
         jobs.update_one(

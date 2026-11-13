@@ -30,7 +30,7 @@ from typing import List, Sequence
 from dotenv import load_dotenv
 
 from full_automation_pipeline import run_full_pipeline
-from unified_pipeline import load_urls_file
+from unified_pipeline import apply_legend_filter_defaults, load_urls_file
 
 
 @dataclass
@@ -311,19 +311,7 @@ def main() -> int:
         os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
     if not args.keep_filters:
-        # Page-level subject filtering now lives in
-        # ``_content_mentions_subject`` inside the unified pipeline, which
-        # drops whole pages that don't mention the legend. The older
-        # per-*line* filter (``PROFILE_TEXT_FILTER_ENABLED``) is too crude
-        # for biographical content — it strips lines that are short or
-        # don't repeat the subject's name (dates, headings, citations) and
-        # left individual sources with too little text to chunk.
-        os.environ.setdefault("INTENT_GATING_ENABLED", "0")
-        os.environ.setdefault("STRICT_SOURCE_POLICY", "0")
-        os.environ.setdefault("PROFILE_ROLE_FILTER_ENABLED", "0")
-        os.environ.setdefault("SOURCE_QUALITY_FILTER_ENABLED", "1")
-        os.environ.setdefault("PROFILE_RELEVANCE_FILTER_ENABLED", "1")
-        os.environ.setdefault("PROFILE_TEXT_FILTER_ENABLED", "0")
+        apply_legend_filter_defaults()
         print(
             "[LegendRun] Cross-source intent gate disabled. Page-level "
             "relevance + source-quality filters and the noise-domain "

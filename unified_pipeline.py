@@ -48,6 +48,29 @@ from api.utils.claim_extractor import extract_claims
 from profile_chunking_pipeline import ProfileChunkingPipeline
 
 
+# The page filters a legend run uses (run_legend_scholar_pipeline.py, and
+# legend_profile_repair.py, which must collect the way a legend run does).
+# Page-level subject filtering lives in ``_content_mentions_subject``, which
+# drops whole pages that don't mention the legend. The older per-*line*
+# filter (``PROFILE_TEXT_FILTER_ENABLED``) is too crude for biographical
+# content: it strips lines that are short or don't repeat the subject's name
+# (dates, headings, citations) and left individual sources with too little
+# text to chunk.
+LEGEND_FILTER_DEFAULTS = {
+    "INTENT_GATING_ENABLED": "0",
+    "STRICT_SOURCE_POLICY": "0",
+    "PROFILE_ROLE_FILTER_ENABLED": "0",
+    "SOURCE_QUALITY_FILTER_ENABLED": "1",
+    "PROFILE_RELEVANCE_FILTER_ENABLED": "1",
+    "PROFILE_TEXT_FILTER_ENABLED": "0",
+}
+
+
+def apply_legend_filter_defaults() -> None:
+    for key, value in LEGEND_FILTER_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+
+
 def load_urls_file(file_path: str) -> List[str]:
     """Load URLs from a text file (one URL per line).
 

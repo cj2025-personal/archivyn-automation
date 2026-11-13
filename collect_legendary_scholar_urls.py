@@ -560,7 +560,12 @@ async def collect_for_scholar(
     max_urls: int,
     sleep_s: float,
     per_query: int,
+    always_search: bool = False,
 ) -> Dict[str, Any]:
+    """always_search: search even when Wikipedia gave enough seeds. A first
+    collection stops at four seeds to spare the search quota; a profile
+    repair (legend_profile_repair.py) runs because those seeds were not
+    enough, so it needs the search results too."""
     queries = _build_queries(scholar)
     candidates: Dict[str, Dict[str, Any]] = {}
     rejected = 0
@@ -575,7 +580,7 @@ async def collect_for_scholar(
         }
 
     enough_seed_sources = len(candidates) >= min(max_urls, 4)
-    if enough_seed_sources:
+    if enough_seed_sources and not always_search:
         ranked = sorted(
             candidates.values(),
             key=lambda item: (_legendary_url_priority(item["normalized_url"]), len(item["normalized_url"])),
