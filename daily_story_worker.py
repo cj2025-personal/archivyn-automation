@@ -151,13 +151,34 @@ NAME_BANNED_TOKENS = {
     "school", "society", "supplies", "university", "www", "www.",
 }
 
-# Output budget for one article call. On gemini-2.5 models the model's thinking
+# Output budget for one article call. On thinking models the model's thinking
 # is counted against max_output_tokens, so the old 6200 left a long, rule-heavy
 # prompt too little room: drafts stopped partway (383-745 words, closing
 # sections missing) and every one became a template. At 24000, 4 of 6 retried
 # drafts came back whole (2026-10-29). Unused budget costs nothing.
 STRICT_MAX_OUTPUT_TOKENS = 24000
 DEFAULT_MAX_OUTPUT_TOKENS = 12000
+
+# The model that writes the stories (the writer, its repairs and judges, the
+# retry, the topic-relevance judge), unless STORY_LLM_MODEL names another.
+# Gemini 2.5 was retired on Vertex on 2026-10-20; gemini-3.5-flash-lite, the
+# cheapest model allowed, wrote stories that passed strict validation in 7
+# of 7 runs of daily_story_writer_eval.py on 2026-11-13 (one more, on a
+# first draft of the eval's legend, failed on a first-person "We"), at its
+# default thinking level, MINIMAL (no thinking tokens; this SDK cannot set
+# a level).
+# The grade-band versions and the identity judge failed their evals on it
+# and have models of their own (daily_story_personalize.DEFAULT_VERSION_MODEL,
+# legend_identity_review.DEFAULT_IDENTITY_MODEL).
+DEFAULT_STORY_MODEL = "gemini-3.5-flash-lite"
+
+# Where model calls go, unless VERTEX_MODEL_LOCATION says otherwise: Vertex's
+# US multi-region (aiplatform.us.rep.googleapis.com). Gemini 3 is not served
+# on us-central1 for this project (404, 2026-11-13). "us" keeps the
+# processing in the United States, where children's data must stay; the
+# global location would not, and is never used. A setting of its own, not
+# GCP_LOCATION, which other Google APIs share.
+DEFAULT_MODEL_LOCATION = "us"
 
 # The editor notes a fallback leaves on a draft whose prose is a fixed template
 # rather than the model's article. Such a draft is never sent to review.
@@ -633,13 +654,10 @@ class DailyStoryWorker:
         self.profile_quality_collection = self.db["daily_story_profile_quality"]
 
         self.gcp_project_id = safe_text(os.getenv("GCP_PROJECT_ID"))
-        self.gcp_location = safe_text(os.getenv("GCP_LOCATION")) or "us-central1"
-        self.model_name = (
-            model_name
-            or safe_text(os.getenv("STORY_LLM_MODEL"))
-            or safe_text(os.getenv("LLM_MODEL"))
-            or "gemini-2.0-flash-001"
-        )
+        self.model_location = safe_text(os.getenv("VERTEX_MODEL_LOCATION")) or DEFAULT_MODEL_LOCATION
+        # One setting: STORY_LLM_MODEL. The old LLM_MODEL alias is gone, so a
+        # model named for some other pipeline cannot end up writing stories.
+        self.model_name = model_name or safe_text(os.getenv("STORY_LLM_MODEL")) or DEFAULT_STORY_MODEL
         self.ml_enabled = (
             safe_text(os.getenv("STORY_ML_ENABLED")).lower() in {"1", "true", "yes", "on"}
             if safe_text(os.getenv("STORY_ML_ENABLED"))
@@ -836,7 +854,7 @@ class DailyStoryWorker:
                     ):
                         os.environ.pop(key, None)
                     os.environ["GRPC_ENABLE_HTTP_PROXY"] = "0"
-                vertexai.init(project=self.gcp_project_id, location=self.gcp_location)
+                vertexai.init(project=self.gcp_project_id, location=self.model_location)
                 self.vertex_model = GenerativeModel(self.model_name)
             except Exception as exc:
                 raise RuntimeError(f"Failed to initialize Vertex AI model '{self.model_name}': {exc}") from exc
@@ -7268,7 +7286,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=None,
-        help="Vertex model name (default: STORY_LLM_MODEL or LLM_MODEL from .env)",
+        help=f"Vertex model name (default: STORY_LLM_MODEL, else {DEFAULT_STORY_MODEL})",
     )
     parser.add_argument("--dry-run", action="store_true", help="Generate deterministic placeholder story (no LLM call)")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM generation")

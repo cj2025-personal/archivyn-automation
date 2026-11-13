@@ -36,7 +36,6 @@ the prompts it would actually send.
 
 Running it (PowerShell 5.1, from this folder):
   $env:LEGEND_MONGO_URI = (gcloud secrets versions access latest --secret=MONGODB_URI)
-  $env:STORY_LLM_MODEL = 'gemini-2.5-flash'
   python legend_child_bio.py --legend-ids id1,id2 --dry-run
   $env:GCP_PROJECT_ID = 'ngo-application-services'
   python legend_child_bio.py --legend-ids id1,id2
@@ -373,10 +372,9 @@ def run(args: argparse.Namespace) -> int:
     if not uri:
         print(f"Set {URI_ENV} to the database to write to (see this script's header).", file=sys.stderr)
         return 2
-    model = safe_text(args.model) or safe_text(os.environ.get("STORY_LLM_MODEL"))
-    if not model:
-        print("Say which model writes: --model or STORY_LLM_MODEL (production's job sets gemini-2.5-flash).", file=sys.stderr)
-        return 2
+    # A bio is written for grades 3-5, as the band versions are, so it takes
+    # their model (daily_story_personalize.version_model), not the story's.
+    model = safe_text(args.model) or personalize.version_model()
     legend_ids = parse_ids(args.legend_ids, args.legend_ids_file)
     if not legend_ids:
         print("Name the legends: --legend-ids id1,id2 or --legend-ids-file.", file=sys.stderr)
@@ -460,7 +458,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="Write at most this many bios in this run")
     parser.add_argument("--force", action="store_true", help="Write again even where a current bio is stored")
     parser.add_argument("--dry-run", action="store_true", help="Write nothing and call no model; print the plan and its cost")
-    parser.add_argument("--model", default=None, help="The model (default: STORY_LLM_MODEL)")
+    parser.add_argument("--model", default=None, help=f"The model (default: the band versions', STORY_VERSION_MODEL, else {personalize.DEFAULT_VERSION_MODEL})")
     parser.add_argument("--price", action="append", default=[], help="MODEL=INPUT/OUTPUT USD per 1M tokens, for a model model_costs does not list")
     return parser
 

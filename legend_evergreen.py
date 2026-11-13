@@ -26,7 +26,6 @@ The database address is read from LEGEND_MONGO_URI only; no .env is loaded.
 
 Running it (PowerShell 5.1, from this folder):
   $env:LEGEND_MONGO_URI = (gcloud secrets versions access latest --secret=MONGODB_URI)
-  $env:STORY_LLM_MODEL = 'gemini-2.5-flash'
   python legend_evergreen.py --legend-ids id1,id2 --stories-each 5 --dry-run
   $env:GCP_PROJECT_ID = 'ngo-application-services'
   python legend_evergreen.py --legend-ids id1,id2 --stories-each 5
@@ -44,6 +43,7 @@ from typing import Any, Dict, List, Optional
 import daily_story_personalize as personalize
 import model_costs
 from daily_story_worker import (
+    DEFAULT_STORY_MODEL,
     EVERGREEN_MAX_ARTICLE_WORDS,
     EVERGREEN_SLOT_KEY,
     FAILED_STORY_STATUSES,
@@ -58,9 +58,9 @@ import legend_identity
 URI_ENV = "LEGEND_MONGO_URI"
 RUNS_COLLECTION = "evergreen_story_runs"
 # The AI editor's model is the admin service's (editorialAutoReview.js
-# EDITORIAL_REVIEW_MODEL, default gemini-2.5-pro); set the same variable here
-# if production sets another.
-DEFAULT_EDITOR_MODEL = "gemini-2.5-pro"
+# EDITORIAL_REVIEW_MODEL, default gemini-3.8-flash); set the same variable
+# here if production sets another.
+DEFAULT_EDITOR_MODEL = "gemini-3.8-flash"
 
 # Sizes the estimate assumes for what does not exist before the run: the
 # story (the template's longest, EVERGREEN_MAX_ARTICLE_WORDS words at about
@@ -163,7 +163,8 @@ def audience_band_count(worker: DailyStoryWorker) -> int:
     return len(personalize.resolve_active_audience(worker)["band_keys"])
 
 
-def estimate(worker: DailyStoryWorker, rows: List[Dict[str, Any]], max_context_chunks: int, writer_model: str, editor_model: str, bands: int):
+def estimate(worker: DailyStoryWorker, rows: List[Dict[str, Any]], max_context_chunks: int, writer_model: str, editor_model: str, bands: int,
+             version_model: str):
     """(steps if every draft passes, repair steps if every draft needs both
     repairs, stories counted, stories that would fail for want of passages)."""
     prompt_chars: List[int] = []
@@ -198,11 +199,11 @@ def estimate(worker: DailyStoryWorker, rows: List[Dict[str, Any]], max_context_c
     base = [
         model_costs.Step("Writer: the story", writer_model, stories, writer_in, WRITER_OUTPUT_TOKENS, worker.max_output_tokens,
                          note=f"input from the {stories} real prompts, mean {mean(prompt_chars):,} characters"),
-        model_costs.Step("Versions: topic ruling per band", writer_model, stories * bands, judge_in, *TOPIC_JUDGE_OUTPUT,
+        model_costs.Step("Versions: topic ruling per band", version_model, stories * bands, judge_in, *TOPIC_JUDGE_OUTPUT,
                          note=f"{bands} bands"),
-        model_costs.Step("Versions: band version", writer_model, stories * bands * low_attempts, variant_in, *VARIANT_OUTPUT,
+        model_costs.Step("Versions: band version", version_model, stories * bands * low_attempts, variant_in, *VARIANT_OUTPUT,
                          note=f"1 attempt; up to {high_attempts} when one fails its checks"),
-        model_costs.Step("Versions: verifier", writer_model, stories * bands * low_attempts, verifier_in, *VERIFIER_OUTPUT),
+        model_costs.Step("Versions: verifier", version_model, stories * bands * low_attempts, verifier_in, *VERIFIER_OUTPUT),
         model_costs.Step("AI editor review", editor_model, stories, model_costs.tokens_for(EDITOR_PROMPT_CHARS), *EDITOR_OUTPUT),
     ]
     extra_attempts = high_attempts - low_attempts
@@ -210,8 +211,8 @@ def estimate(worker: DailyStoryWorker, rows: List[Dict[str, Any]], max_context_c
         model_costs.Step("Repair: failing sections", writer_model, stories, model_costs.tokens_for(mean(passage_chars) + 4 * 800 + 1500), *SECTION_REPAIR_OUTPUT),
         model_costs.Step("Repair: whole story", writer_model, stories, writer_in + model_costs.tokens_for(STORY_CHARS + 6000 + 1200),
                          WRITER_OUTPUT_TOKENS, int(worker.max_output_tokens * 0.9)),
-        model_costs.Step("Versions: further attempts", writer_model, stories * bands * extra_attempts, variant_in, *VARIANT_OUTPUT),
-        model_costs.Step("Versions: their verifier", writer_model, stories * bands * extra_attempts, verifier_in, *VERIFIER_OUTPUT),
+        model_costs.Step("Versions: further attempts", version_model, stories * bands * extra_attempts, variant_in, *VARIANT_OUTPUT),
+        model_costs.Step("Versions: their verifier", version_model, stories * bands * extra_attempts, verifier_in, *VERIFIER_OUTPUT),
     ]
     return base, repairs, stories, short
 
@@ -237,10 +238,7 @@ def run(args: argparse.Namespace) -> int:
     if not uri:
         print(f"Set {URI_ENV} to the database to write to (see this script's header).", file=sys.stderr)
         return 2
-    model = safe_text(args.model) or safe_text(os.environ.get("STORY_LLM_MODEL"))
-    if not model:
-        print("Say which model writes: --model or STORY_LLM_MODEL (production's job sets gemini-2.5-flash).", file=sys.stderr)
-        return 2
+    model = safe_text(args.model) or safe_text(os.environ.get("STORY_LLM_MODEL")) or DEFAULT_STORY_MODEL
     legend_ids = parse_ids(args.legend_ids, args.legend_ids_file)
     if not legend_ids:
         print("Name the legends: --legend-ids id1,id2 or --legend-ids-file.", file=sys.stderr)
@@ -262,7 +260,8 @@ def run(args: argparse.Namespace) -> int:
         story_date = parse_date(args.date).isoformat()
         if args.dry_run:
             bands = audience_band_count(worker)
-            base, repairs, stories, short = estimate(worker, rows, args.max_context_chunks, model, editor_model, bands)
+            base, repairs, stories, short = estimate(worker, rows, args.max_context_chunks, model, editor_model, bands,
+                                                     personalize.version_model())
             print_plan(rows, args.stories_each)
             print(f"\nWould write {stories} stories dated {story_date}; {short} would fail for want of passages. Nothing was written and no model was called.")
             if stories:
@@ -342,7 +341,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="Write at most this many stories in this run")
     parser.add_argument("--dry-run", action="store_true", help="Write nothing and call no model; print the plan and its cost")
     parser.add_argument("--date", default=None, help="Story date for what is written (default: today, UTC)")
-    parser.add_argument("--model", default=None, help="The writer's model (default: STORY_LLM_MODEL)")
+    parser.add_argument("--model", default=None, help=f"The writer's model (default: STORY_LLM_MODEL, else {DEFAULT_STORY_MODEL})")
     parser.add_argument("--max-context-chunks", type=int, default=12)
     parser.add_argument("--ignore-profile-quality", action="store_true", help="Do not hold legends to the profile-quality gate")
     parser.add_argument("--price", action="append", default=[], help="MODEL=INPUT/OUTPUT USD per 1M tokens, for a model model_costs does not list")

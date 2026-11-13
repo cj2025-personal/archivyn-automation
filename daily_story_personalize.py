@@ -18,6 +18,20 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from daily_story_worker import STORY_MODE_EVERGREEN, DailyStoryWorker, parse_date, safe_text, utc_now_iso
 
 
+# The model that writes and checks the grade-band versions, unless
+# STORY_VERSION_MODEL names another. Not the story model: on 2026-11-13
+# gemini-3.5-flash-lite, which writes the stories, wrote grades 3-5 versions
+# too short to pass (206 to 239 words where 300 is the least) in 3 of 4 runs
+# of daily_story_writer_eval.py, where gemini-3.8-flash, at its default
+# thinking level, and the retired gemini-2.5-flash passed every run. A
+# version is short beside its story, so the dearer model costs little.
+DEFAULT_VERSION_MODEL = "gemini-3.8-flash"
+
+
+def version_model() -> str:
+    return safe_text(os.getenv("STORY_VERSION_MODEL")) or DEFAULT_VERSION_MODEL
+
+
 AUDIENCE_CONTRACT_VERSION = "active-student-audience-v1"
 PROMPT_VERSION = "editorial-access-ladder-v4"
 READY_COMPATIBLE_PROMPT_VERSIONS = {
@@ -726,7 +740,7 @@ def run_personalization(
     scholar_id: str = "",
     story_mode: str = "",
 ) -> Dict[str, Any]:
-    worker = DailyStoryWorker(use_llm=not (dry_run or no_llm), trends_enabled=False)
+    worker = DailyStoryWorker(model_name=version_model(), use_llm=not (dry_run or no_llm), trends_enabled=False)
     try:
         audience = resolve_active_audience(worker)
         story_filter: Dict[str, Any] = {

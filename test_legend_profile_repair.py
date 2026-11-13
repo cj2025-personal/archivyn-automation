@@ -569,7 +569,7 @@ class RepairTests(unittest.TestCase):
         self.assertIn("Brave Search API: 19 = 19 queries", text)
         self.assertIn("Wikipedia API: 3 to 6 requests a legend x 1 legends to look up = 3 to 6", text)
         self.assertIn("Seed pages: at most 50", text)
-        self.assertRegex(text, r"Identity review, ada-brightwater \[gemini-2\.5-flash\]: 1 calls x \([\d,]+ in x \$0\.30/M \+ [\d,]+\.\.8,192 out x \$2\.50/M\)")
+        self.assertRegex(text, r"Identity review, ada-brightwater \[gemini-3\.5-flash-lite\]: 1 calls x \([\d,]+ in x \$0\.30/M \+ [\d,]+\.\.8,192 out x \$2\.50/M\)")
         self.assertIn("Total: $", text)
 
     def test_a_repair_writes_only_the_passages_and_the_label_then_the_legend_is_writable(self) -> None:
@@ -680,7 +680,7 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertRegex(text, r"saved work: pages fetched \S+ \(5 URLs\): would be ready \d+ with \d+ passages, \d+ creditable from 5 pages: would write")
         self.assertIn("Brave Search API: 0 = 0 queries", text)
-        self.assertRegex(text, r"Identity review, ada-brightwater \[gemini-2\.5-flash\]: 1 calls x \([\d,]+ in .*input from its prompt")
+        self.assertRegex(text, r"Identity review, ada-brightwater \[gemini-3\.5-flash-lite\]: 1 calls x \([\d,]+ in .*input from its prompt")
         self.assertEqual(snapshot(self.local.db), before)
 
     def test_without_a_model_or_ids_it_does_not_start(self) -> None:

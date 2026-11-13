@@ -4,12 +4,14 @@ by the real model through the stage's own prompt and schema, the verdicts
 counted by legend_identity exactly as in production. Run it whenever the
 prompt, the policy or LEGEND_IDENTITY_MODEL changes.
 
-  python legend_identity_eval.py                 # judge model: LEGEND_IDENTITY_MODEL, else STORY_LLM_MODEL
-  python legend_identity_eval.py --model gemini-2.5-pro
+  python legend_identity_eval.py                 # judge model: LEGEND_IDENTITY_MODEL, else the stage's default
+  python legend_identity_eval.py --model gemini-3.5-flash-lite
 
-Needs GCP_PROJECT_ID (and GCP_LOCATION) and Google credentials (application
-default credentials work). No database. One model call per case; the cases
-are written for this eval, excerpts kept short. Exit 0 when every case
+Needs GCP_PROJECT_ID and Google credentials (application default credentials
+work); calls go where the worker's go (VERTEX_MODEL_LOCATION). No database.
+One model call per case; the cases are written for this eval, excerpts kept
+short. The tokens the run used are printed with it, thinking apart, so a
+model's cost can be weighed beside its verdicts. Exit 0 when every case
 passes, 1 when any fails.
 """
 from __future__ import annotations
@@ -21,7 +23,7 @@ import sys
 from typing import Any, Dict, List
 
 import legend_identity as identity
-from legend_identity_review import IDENTITY_SCHEMA, JUDGE_MAX_TOKENS, judge_prompt
+from legend_identity_review import IDENTITY_SCHEMA, JUDGE_MAX_TOKENS, identity_model, judge_prompt
 
 A, D, N, U = identity.ABOUT_LEGEND, identity.DIFFERENT_PERSON, identity.NOT_ABOUT_A_PERSON, identity.UNCLEAR
 
@@ -108,13 +110,30 @@ def _judge_worker(model: str):
     import vertexai
     from vertexai.generative_models import GenerativeModel
 
-    from daily_story_worker import DailyStoryWorker
+    from daily_story_worker import DEFAULT_MODEL_LOCATION, DailyStoryWorker
 
-    vertexai.init(project=os.environ["GCP_PROJECT_ID"], location=os.getenv("GCP_LOCATION") or "us-central1")
+    vertexai.init(project=os.environ["GCP_PROJECT_ID"], location=os.getenv("VERTEX_MODEL_LOCATION") or DEFAULT_MODEL_LOCATION)
     worker = DailyStoryWorker.__new__(DailyStoryWorker)
-    worker.vertex_model = GenerativeModel(model)
+    worker.vertex_model = _Counted(GenerativeModel(model))
     worker.model_name = model
     return worker
+
+
+class _Counted:
+    """The model, with the tokens of every call it answers added up."""
+
+    def __init__(self, model: Any) -> None:
+        self.model = model
+        self.usage = {"calls": 0, "input": 0, "output": 0, "thinking": 0}
+
+    def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+        response = self.model.generate_content(*args, **kwargs)
+        meta = getattr(response, "usage_metadata", None)
+        self.usage["calls"] += 1
+        self.usage["input"] += int(getattr(meta, "prompt_token_count", 0) or 0)
+        self.usage["output"] += int(getattr(meta, "candidates_token_count", 0) or 0)
+        self.usage["thinking"] += int(getattr(meta, "thoughts_token_count", 0) or 0)
+        return response
 
 
 def run_case(worker: Any, case: Dict[str, Any], model: str) -> Dict[str, Any]:
@@ -154,7 +173,7 @@ def run_case(worker: Any, case: Dict[str, Any], model: str) -> Dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--model", default=os.getenv("LEGEND_IDENTITY_MODEL") or os.getenv("STORY_LLM_MODEL") or "gemini-2.5-flash")
+    parser.add_argument("--model", default=identity_model())
     args = parser.parse_args()
     worker = _judge_worker(args.model)
     results = []
@@ -164,7 +183,7 @@ def main() -> int:
         except Exception as exc:
             results.append({"case": case["name"], "passed": False, "problems": [f"call failed: {exc}"]})
     passed = sum(1 for r in results if r["passed"])
-    print(json.dumps({"model": args.model, "policy": identity.IDENTITY_POLICY_VERSION, "passed": passed, "of": len(results), "results": results}, indent=2))
+    print(json.dumps({"model": args.model, "policy": identity.IDENTITY_POLICY_VERSION, "passed": passed, "of": len(results), "usage": worker.vertex_model.usage, "results": results}, indent=2))
     return 0 if passed == len(results) else 1
 
 

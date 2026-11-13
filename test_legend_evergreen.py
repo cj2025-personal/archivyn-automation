@@ -54,7 +54,8 @@ needs_local_mongo = unittest.skipUnless(LOCAL_UP, "needs the local test MongoDB 
 QUIET_ENV = {
     "STORY_ML_ENABLED": "0",
     "STORY_ENFORCE_PROFILE_QUALITY": "",
-    "STORY_LLM_MODEL": "gemini-2.5-flash",
+    "STORY_LLM_MODEL": "gemini-3.5-flash-lite",
+    "STORY_VERSION_MODEL": "",
     "GCP_PROJECT_ID": "",
     "MONGODB_DB": "",
     "EDITORIAL_REVIEW_MODEL": "",
@@ -166,7 +167,7 @@ def make_worker(uri: str, *, writer=None, structured=None, read_only: bool = Fal
     is made without a model, then told it has one."""
     worker = worker_module.DailyStoryWorker(
         use_llm=False, trends_enabled=False, mongodb_uri=uri, load_env_file=False, read_only=read_only,
-        model_name="gemini-2.5-flash", **kwargs,
+        model_name="gemini-3.5-flash-lite", **kwargs,
     )
     if writer or structured:
         worker.use_llm = True
@@ -263,15 +264,25 @@ class EvergreenTemplateTests(unittest.TestCase):
 
 class CostTests(unittest.TestCase):
     def test_the_arithmetic_is_shown_and_an_unknown_model_is_not_guessed(self) -> None:
-        step = model_costs.Step("Writer", "gemini-2.5-flash", 10, 4000, 3500, 24000)
+        step = model_costs.Step("Writer", "gemini-3.5-flash-lite", 10, 4000, 3500, 24000)
         low, high = step.cost()
         self.assertAlmostEqual(low, 10 * (4000 * 0.30 + 3500 * 2.50) / 1e6)
         self.assertAlmostEqual(high, 10 * (4000 * 0.30 + 24000 * 2.50) / 1e6)
         self.assertIn("10 calls x (4,000 in x $0.30/M + 3,500..24,000 out x $2.50/M)", step.arithmetic())
-        self.assertEqual(model_costs.price_of("gemini-2.5-flash-001"), model_costs.PRICES["gemini-2.5-flash"])
+        self.assertEqual(model_costs.price_of("gemini-3.5-flash-lite-001"), model_costs.PRICES["gemini-3.5-flash-lite"])
         with self.assertRaises(KeyError):
             model_costs.price_of("gemini-9-ultra")
+        with self.assertRaises(KeyError, msg="a retired model is not priced"):
+            model_costs.price_of("gemini-2.5-flash")
+        with self.assertRaises(KeyError, msg="another model, not a version of one listed"):
+            model_costs.price_of("gemini-3.8-flash-lite")
         self.assertEqual(model_costs.price_of("gemini-9-ultra", model_costs.parse_price_overrides(["gemini-9-ultra=1/2"])), (1.0, 2.0))
+
+    def test_an_announced_price_applies_from_its_day(self) -> None:
+        self.assertEqual(model_costs.price_of("gemini-3.8-flash", day="2026-12-31"), (0.75, 3.75))
+        self.assertEqual(model_costs.price_of("gemini-3.8-flash", day="2027-01-01"), (1.50, 7.50))
+        self.assertEqual(model_costs.price_of("gemini-3.8-flash-001", day="2027-03-01"), (1.50, 7.50))
+        self.assertEqual(model_costs.price_of("gemini-3.5-flash-lite", day="2027-03-01"), (0.30, 2.50))
 
 
 class ChildBioCheckTests(unittest.TestCase):
@@ -476,8 +487,9 @@ class EvergreenWritingTests(unittest.TestCase):
         self.assertEqual(self._stories(), [])
         self.assertIn("Would write 4 stories", output)
         self.assertIn("COST ESTIMATE, 4 stories", output)
-        self.assertRegex(output, r"Writer: the story \[gemini-2\.5-flash\]: 4 calls x \([\d,]+ in x \$0\.30/M")
-        self.assertIn("AI editor review [gemini-2.5-pro]", output)
+        self.assertRegex(output, r"Writer: the story \[gemini-3\.5-flash-lite\]: 4 calls x \([\d,]+ in x \$0\.30/M")
+        self.assertRegex(output, r"Versions: band version \[gemini-3\.8-flash\]")
+        self.assertIn("AI editor review [gemini-3.8-flash]", output)
         self.assertIn("Total: $", output)
 
     def test_a_dry_run_cannot_write_even_by_mistake(self) -> None:
@@ -588,7 +600,7 @@ class ChildBioRunTests(unittest.TestCase):
         self.assertNotIn("bio_by_band", doc["about"])
         self.assertNotIn("legend_child_bio_runs", self.local.db.list_collection_names())
         self.assertIn("Would write 2 bios", output)
-        self.assertRegex(output, r"Bio writer \[gemini-2\.5-flash\]: 2 calls x \([\d,]+ in")
+        self.assertRegex(output, r"Bio writer \[gemini-3\.8-flash\]: 2 calls x \([\d,]+ in", "a bio takes the band versions' model")
 
 
 @needs_local_mongo

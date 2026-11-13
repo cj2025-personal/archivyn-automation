@@ -27,7 +27,9 @@ chromadb>=0.4.0
 tqdm>=4.65.0
 numpy>=1.24.0
 openai>=1.0.0
-google-cloud-aiplatform>=1.70.0
+# Vertex's US multi-region (location "us", where the pipeline's models
+# are served) is called by 1.165.1; 1.160.0 and earlier refuse it.
+google-cloud-aiplatform>=1.165.1
 psutil>=5.9.0
 pymongo>=4.6.0
 apscheduler>=3.10.4

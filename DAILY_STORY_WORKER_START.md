@@ -4,9 +4,9 @@
 
 - `MONGODB_URI` is set in `.env`
 - `LLM_PROVIDER=vertex`
-- `GCP_PROJECT_ID` and `GCP_LOCATION` are set
+- `GCP_PROJECT_ID` is set; model calls go to `VERTEX_MODEL_LOCATION` (default `us`, Vertex's US multi-region; never `global`)
 - `GOOGLE_APPLICATION_CREDENTIALS` points to a valid service-account JSON key
-- `STORY_LLM_MODEL` (or `LLM_MODEL`) is set
+- (Optional) `STORY_LLM_MODEL` (default `gemini-3.5-flash-lite`)
 - Source scholar data exists in Mongo collection `legend_scholars`
 - (Optional) `STORY_ML_ENABLED=1` (default on)
 - (Optional) `STORY_EMBEDDING_MODEL=all-MiniLM-L6-v2`

@@ -14,7 +14,7 @@ so the nightly run only pays for new or re-sourced legends.
   python legend_identity_review.py --force             # judge again even when unchanged
   python legend_identity_review.py --dry-run           # judge, print, write nothing
 
-Settings: LEGEND_IDENTITY_MODEL (default: the story model, STORY_LLM_MODEL),
+Settings: LEGEND_IDENTITY_MODEL (default DEFAULT_IDENTITY_MODEL, below),
 LEGEND_IDENTITY_CONCURRENCY (default 4).
 
 Prints the run summary as JSON. Story generation waits on this stage, so the
@@ -40,6 +40,20 @@ from daily_story_worker import DailyStoryWorker, safe_text, utc_now_iso
 
 DEFAULT_CONCURRENCY = 4
 JUDGE_MAX_TOKENS = 8192
+
+# The judge's model, unless LEGEND_IDENTITY_MODEL names another. Not the
+# story model: gemini-3.5-flash-lite, which writes the stories, read a
+# misspelled surname on the roster as correct on every try in
+# legend_identity_eval.py (2026-11-13, "Marie Daley" for Marie Maynard Daly),
+# where gemini-3.8-flash passed every case, at its default thinking level.
+# A legend is judged again only when its sources change, so the dearer model
+# costs little.
+DEFAULT_IDENTITY_MODEL = "gemini-3.8-flash"
+
+
+def identity_model() -> str:
+    return safe_text(os.getenv("LEGEND_IDENTITY_MODEL")) or DEFAULT_IDENTITY_MODEL
+
 
 IDENTITY_SCHEMA: Dict[str, Any] = {
     "type": "OBJECT",
@@ -160,7 +174,8 @@ def _legends(worker: DailyStoryWorker, scholar_id: Optional[str], max_scholars: 
 
 
 def _judge_model(worker: DailyStoryWorker) -> str:
-    """LEGEND_IDENTITY_MODEL when set, else the worker's story model."""
+    """LEGEND_IDENTITY_MODEL when set, else the model of the worker this stage
+    was handed (its own is made with identity_model())."""
     wanted = safe_text(os.getenv("LEGEND_IDENTITY_MODEL"))
     if wanted and wanted != worker.model_name:
         import daily_story_worker as worker_module
@@ -180,7 +195,7 @@ def run_identity_review(
     worker: Optional[DailyStoryWorker] = None,
 ) -> Dict[str, Any]:
     own_worker = worker is None
-    worker = worker or DailyStoryWorker(use_llm=True, trends_enabled=False)
+    worker = worker or DailyStoryWorker(model_name=identity_model(), use_llm=True, trends_enabled=False)
     try:
         model = _judge_model(worker)
         events = worker.db["legend_identity_review_events"]

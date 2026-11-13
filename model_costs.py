@@ -5,32 +5,49 @@ tokens come from the prompts the run would actually send (their characters,
 at CHARS_PER_TOKEN). Output cannot be known before the call, so every step
 gives two figures: a low one (the visible answer it is expected to return,
 no thinking) and a high one (the step's output cap, which the call cannot
-exceed). On Gemini 2.5 the model's thinking is billed as output and counts
-against the cap, so the true cost lies between the two.
+exceed). The model's thinking is billed as output and counts against the
+cap, so the true cost lies between the two.
 
-Prices are list prices for standard (online) requests, USD per million
-tokens, as checked on PRICES_CHECKED_ON at PRICES_SOURCE. The Vertex AI
-pricing page did not render to the checker that day; the Gemini API's page
-gives the same list prices Vertex has charged for these models. That page
-also marks gemini-2.5-pro and gemini-2.5-flash deprecated, with requests to
-route to newer models from 2026-12-01: a run after that date should be
-priced again. A model missing here is not guessed: pass its prices with
---price MODEL=INPUT/OUTPUT.
+Prices are for standard (online) requests on a Vertex AI regional endpoint,
+USD per million tokens, about a tenth above Google's global list price, as
+given on PRICES_CHECKED_ON (PRICES_SOURCE). The pipeline calls the US
+multi-region (daily_story_worker DEFAULT_MODEL_LOCATION), priced the same.
+Only the models the pipeline may use are listed: Gemini 2.5 was retired on
+2026-10-20. A price Google has announced for a later day is in PRICE_CHANGES
+and applies from that day. A model missing here is not guessed: pass its
+prices with --price MODEL=INPUT/OUTPUT.
 """
 from __future__ import annotations
 
 import math
+import re
+from datetime import date
 from typing import Dict, Iterable, List, Optional, Tuple
 
-PRICES_CHECKED_ON = "2026-11-12"
-PRICES_SOURCE = "https://aistudio.google.com/docs/pricing (paid tier, standard)"
+PRICES_CHECKED_ON = "2026-11-13"
+PRICES_SOURCE = "Vertex AI standard prices, regional endpoint, as the owner gave them; the pricing page did not load that day"
 
 # model -> (input, output) USD per 1M tokens; output includes thinking.
 PRICES: Dict[str, Tuple[float, float]] = {
-    "gemini-2.5-pro": (1.25, 10.00),       # prompts up to 200k tokens
-    "gemini-2.5-flash": (0.30, 2.50),
-    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-3.8-flash": (0.75, 3.75),
 }
+
+# (model, first day, (input, output)): prices announced for a later day.
+PRICE_CHANGES: List[Tuple[str, str, Tuple[float, float]]] = [
+    ("gemini-3.8-flash", "2027-01-01", (1.50, 7.50)),
+]
+
+
+def prices_on(day: Optional[str] = None) -> Dict[str, Tuple[float, float]]:
+    """PRICES as they stand on the day (YYYY-MM-DD; default today)."""
+    day = day or date.today().isoformat()
+    table = dict(PRICES)
+    for model, first_day, price in sorted(PRICE_CHANGES, key=lambda change: change[1]):
+        if day >= first_day:
+            table[model] = price
+    return table
 
 # English prose and JSON run close to four characters a token on Gemini's
 # tokenizer; it is an estimate, said as one in every report.
@@ -53,14 +70,15 @@ def parse_price_overrides(values: Iterable[str]) -> Dict[str, Tuple[float, float
     return out
 
 
-def price_of(model: str, overrides: Optional[Dict[str, Tuple[float, float]]] = None) -> Tuple[float, float]:
-    """The model's (input, output) price. A model id with a version suffix
-    (gemini-2.5-flash-001) is priced as its family."""
-    table = {**PRICES, **(overrides or {})}
+def price_of(model: str, overrides: Optional[Dict[str, Tuple[float, float]]] = None, day: Optional[str] = None) -> Tuple[float, float]:
+    """The model's (input, output) price on the day (default today). A model
+    id with a version number (gemini-3.8-flash-001) is priced as its family;
+    another model whose name starts the same (gemini-3.8-flash-lite) is not."""
+    table = {**prices_on(day), **(overrides or {})}
     if model in table:
         return table[model]
-    for name in sorted(table, key=len, reverse=True):
-        if model.startswith(name + "-"):
+    for name in table:
+        if re.fullmatch(re.escape(name) + r"-\d+", model):
             return table[name]
     raise KeyError(f"No list price for {model!r}: pass --price {model}=INPUT/OUTPUT (USD per 1M tokens).")
 
@@ -109,7 +127,7 @@ def report(title: str, steps: List[Step], overrides: Optional[Dict[str, Tuple[fl
         lines.append("  " + step.arithmetic(overrides))
     lines.append(f"  Total: ${total_low:.2f} to ${total_high:.2f}")
     lines.append(
-        f"  Prices USD per 1M tokens, list, checked {PRICES_CHECKED_ON} ({PRICES_SOURCE}); "
+        f"  Prices USD per 1M tokens as of today, checked {PRICES_CHECKED_ON} ({PRICES_SOURCE}); "
         f"input tokens = prompt characters / {CHARS_PER_TOKEN:g}; output low = the expected visible answer, "
         "high = the call's output cap (thinking is billed as output)."
     )
