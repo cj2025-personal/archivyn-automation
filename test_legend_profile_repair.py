@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import io
 import json
 import os
@@ -136,15 +137,22 @@ def legend(count: int = 19, *, label: str = "needs_data_repair", score: int = 64
     return _identified(doc)
 
 
-def wikipedia_api(url: str, params: Dict[str, Any], headers: Dict[str, str] | None = None) -> Dict[str, Any]:
-    """Wikipedia's API, as collect._get_json is answered."""
-    assert url == "https://en.wikipedia.org/w/api.php" and (headers or {}).get("User-Agent") == USER_AGENT
-    if params.get("list") == "search":
-        return {"query": {"search": [{"title": NAME}]}}
-    if params.get("prop") == "info":
-        return {"query": {"pages": {"1": {"fullurl": WIKI}}}}
-    links = [NASA, "https://books.google.com/books?id=ada", "https://www.researchgate.net/profile/Ada_Brightwater"]
-    return {"query": {"pages": {"1": {"extlinks": [{"*": link} for link in links]}}}}
+def wikipedia_api_linking(links: List[str]) -> Any:
+    """Wikipedia's API, as collect._get_json is answered, for an article
+    whose external links are links."""
+
+    def answer(url: str, params: Dict[str, Any], headers: Dict[str, str] | None = None) -> Dict[str, Any]:
+        assert url == "https://en.wikipedia.org/w/api.php" and (headers or {}).get("User-Agent") == USER_AGENT
+        if params.get("list") == "search":
+            return {"query": {"search": [{"title": NAME}]}}
+        if params.get("prop") == "info":
+            return {"query": {"pages": {"1": {"fullurl": WIKI}}}}
+        return {"query": {"pages": {"1": {"extlinks": [{"*": link} for link in links]}}}}
+
+    return answer
+
+
+wikipedia_api = wikipedia_api_linking([NASA, "https://books.google.com/books?id=ada", "https://www.researchgate.net/profile/Ada_Brightwater"])
 
 
 SEARCH_RESULTS = [
@@ -457,6 +465,8 @@ class DiagnosisDatabaseTests(unittest.TestCase):
 @needs_scraping_stack
 @needs_local_mongo
 class RepairTests(unittest.TestCase):
+    """The full re-collection (--recollect)."""
+
     def setUp(self) -> None:
         self.env = mock.patch.dict(os.environ, {**QUIET_ENV, "BRAVE_SEARCH_API": "test-key", "OPENAI_API_KEY": "", "LEGEND_IDENTITY_MODEL": ""})
         self.env.start()
@@ -489,7 +499,7 @@ class RepairTests(unittest.TestCase):
         values = {
             "legend_ids_file": str(self.ids), "legend_ids": "", "dry_run": False, "max_urls": 50, "sleep_seconds": 0,
             "per_query_results": 15, "min_quality": 60, "url_lists_dir": str(self.lists), "work_dir": str(self.work),
-            "fresh": False, "model": None, "price": [],
+            "fresh": False, "model": None, "price": [], "recollect": True, "fetch": False,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -524,7 +534,7 @@ class RepairTests(unittest.TestCase):
         self.assertIn("stale-label (Stale Label): relabel: stored needs_data_repair 40, its passages score ready 74: would correct the label only", text)
         self.assertIn("not-a-legend: not found", text)
         self.assertIn("Brave Search API: 19 = 19 queries", text)
-        self.assertIn("Wikipedia API: 3 to 6 requests a legend x 1 legends to search = 3 to 6", text)
+        self.assertIn("Wikipedia API: 3 to 6 requests a legend x 1 legends to look up = 3 to 6", text)
         self.assertIn("Seed pages: at most 50", text)
         self.assertRegex(text, r"Identity review, ada-brightwater \[gemini-2\.5-flash\]: 1 calls x \([\d,]+ in x \$0\.30/M \+ [\d,]+\.\.8,192 out x \$2\.50/M\)")
         self.assertIn("Total: $", text)
@@ -647,6 +657,211 @@ class RepairTests(unittest.TestCase):
             self.assertEqual(repair.run(self._args(legend_ids_file=""), worker=mock.Mock()), 2)
         with mock.patch.dict(os.environ, {repair.URI_ENV: ""}), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(repair.run(self._args()), 2)
+
+
+def stored_bytes(rag_context: Dict[str, Any]) -> Dict[str, List[bytes]]:
+    """Each stored section's passages as BSON, the bytes MongoDB keeps."""
+    import bson
+
+    return {section: [bson.encode(c) for c in chunks] for section, chunks in rag_context["section_chunks"].items()}
+
+
+@needs_scraping_stack
+class AppendMergeTests(unittest.TestCase):
+    def test_stored_passages_stay_as_they_are_and_duplicates_are_skipped(self) -> None:
+        stored = legend()["rag_context"]
+        stored["section_text"] = {"legacy": "the stored legacy text"}
+        stored["source_catalog"] = [{"source_url": WIKI}]
+        stored["chunk_source_map"] = {}
+        before = copy.deepcopy(stored)
+        first_stored = stored["section_chunks"]["biography"][0]
+        new = {
+            "section_chunks": {
+                "Dr. Ada Brightwater, page 3": [
+                    {"chunk_id": "src_nasa:0", "text": "  " + first_stored["text"].upper() + "  "},  # a stored passage again
+                    {"chunk_id": "src_nasa:1", "text": "Ada Brightwater measured the light of fireflies at night."},
+                    {"chunk_id": "src_nasa:2", "text": "ada brightwater measured   the light of fireflies at night."},  # the line above again
+                ],
+                "legacy": [{"chunk_id": f"{PID}-c0", "text": "Ada Brightwater's notebooks are kept at the college."}],
+            },
+            "source_catalog": [{"source_url": WIKI}, {"source_url": NASA}],
+            "chunk_source_map": {"src_nasa:1": [{"source_url": NASA}], f"{PID}-c0": [{"source_url": COLLEGE}]},
+        }
+        merged, added, duplicates = repair.appended_rag_context(stored, new, record={"at": "now", "urls": [NASA]})
+        self.assertEqual((added, duplicates), (2, 2))
+        self.assertEqual(stored, before, "the stored rag_context handed in is not changed")
+        after = stored_bytes(merged)
+        for section, chunks in stored_bytes(before).items():
+            self.assertEqual(after[section][: len(chunks)], chunks, section)
+        self.assertEqual(list(merged["section_chunks"])[:3], list(before["section_chunks"]), "stored titles keep their place")
+        legacy = merged["section_chunks"]["legacy"]
+        self.assertEqual(len(legacy), len(before["section_chunks"]["legacy"]) + 1)
+        self.assertEqual(legacy[-1]["chunk_id"], f"{PID}-c0:appended:{19 + 1}", "a clashing id is renamed, the stored one kept")
+        self.assertEqual(legacy[-1]["order"], 20)
+        self.assertEqual(merged["section_chunks"]["Dr. Ada Brightwater, page 3"][0]["order"], 19)
+        self.assertEqual(merged["chunk_count"], 21)
+        self.assertEqual(merged["sections_available"], [*before["sections_available"], "Dr. Ada Brightwater, page 3"])
+        self.assertTrue(merged["section_text"]["legacy"].startswith("the stored legacy text\n\n"))
+        self.assertEqual([s["source_url"] for s in merged["source_catalog"]], [WIKI, NASA])
+        self.assertEqual(set(merged["chunk_source_map"]), {"src_nasa:1", f"{PID}-c0:appended:20"})
+        self.assertEqual(merged["appended"], [{"at": "now", "urls": [NASA], "passages": 2, "duplicates_skipped": 2}])
+
+
+@needs_scraping_stack
+@needs_local_mongo
+class AppendTests(unittest.TestCase):
+    """The default: fetch the stored list's pages that gave no passage (and
+    Wikipedia's links not yet stored) and add their passages to the stored
+    ones."""
+
+    WIKI_LINKS = [NASA, SMITHSONIAN, "https://books.google.com/books?id=ada", "https://www.researchgate.net/profile/Ada_Brightwater"]
+    FORBIDDEN = [
+        "https://www.researchgate.net/profile/Ada_Brightwater", "https://scholar.google.com/citations?user=ada",
+        "https://www.nytimes.com/1999/ada.html", "https://www.facebook.com/ada.brightwater", "ftp://files.example.org/ada",
+    ]
+
+    def setUp(self) -> None:
+        self.env = mock.patch.dict(os.environ, {**QUIET_ENV, "BRAVE_SEARCH_API": "", "OPENAI_API_KEY": "", "LEGEND_IDENTITY_MODEL": ""})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.local = LocalDatabase()
+        self.addCleanup(self.local.close)
+        self.local.db["legend_scholars"].insert_one(legend())
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lists = Path(self.tmp.name, "final")
+        self.lists.mkdir()
+        (self.lists / f"{PID}.txt").write_text("\n".join([WIKI, MUSEUM, NASA, COLLEGE, *self.FORBIDDEN]) + "\n", encoding="utf-8")
+        (self.lists / f"{PID}.meta.json").write_text(json.dumps({"profile_id": PID, "profile_name": NAME, "profile_url": WIKI, "field": "Chemistry"}), encoding="utf-8")
+        self.work = Path(self.tmp.name, "work")
+        self.judge = mock.Mock(side_effect=judge)
+        self.wikipedia = mock.Mock(side_effect=wikipedia_api_linking(self.WIKI_LINKS))
+
+    def _run(self, scraper: Scraper, *, dry_run: bool = False, fetch: bool = False, cli: List[str] = ()) -> Any:
+        args = repair.build_arg_parser().parse_args([
+            "--legend-ids", PID, "--url-lists-dir", str(self.lists), "--work-dir", str(self.work), *cli,
+            *(["--dry-run"] if dry_run else []), *(["--fetch"] if fetch else []),
+        ])
+        worker = make_worker(self.local.uri, structured=self.judge, read_only=dry_run)
+        self.addCleanup(worker.close)
+        out = io.StringIO()
+        searches = Searches()
+        with mock.patch.object(collect, "_get_json", self.wikipedia), mock.patch.object(collect, "brave_search", searches), \
+                contextlib.redirect_stdout(out):
+            code = repair.run(args, worker=worker, scraper=scraper)
+        self.assertEqual(searches.queries, [], "an append never searches")
+        text = out.getvalue()
+        if dry_run:
+            return code, text
+        return code, {r["profile_id"]: r for r in json.loads(text[text.rindex('{\n  "run_id"'):])["results"]}
+
+    def _stored(self) -> Dict[str, Any]:
+        return self.local.db["legend_scholars"].find_one({"_id": PID})
+
+    def test_append_is_the_default(self) -> None:
+        self.assertFalse(repair.build_arg_parser().parse_args(["--legend-ids-file", "ids.txt"]).recollect)
+
+    def test_only_pages_that_gave_nothing_are_fetched_and_the_stored_passages_are_kept_byte_for_byte(self) -> None:
+        before = self._stored()["rag_context"]
+        scraper = Scraper()
+        code, results = self._run(scraper)
+        ada = results[PID]
+        self.assertEqual((code, ada["outcome"], ada["mode"]), (0, "written", "append"), ada)
+        # NASA and the college from the stored list; the Smithsonian from
+        # Wikipedia's links. Not the pages that already gave passages, not
+        # the article (stored), not a URL the rules refuse.
+        self.assertEqual(same_pages(scraper.asked), same_pages([NASA, COLLEGE, SMITHSONIAN]))
+        for asked in scraper.asked:
+            self.assertFalse(any(bad in asked for bad in NEVER_FETCHED), asked)
+        self.assertEqual(ada["candidate"]["before"], 19)
+        self.assertEqual(ada["candidate"]["passages"], 19 + ada["candidate"]["added"])
+
+        after = self._stored()["rag_context"]
+        stored = stored_bytes(after)
+        for section, chunks in stored_bytes(before).items():
+            self.assertEqual(stored[section][: len(chunks)], chunks, f"{section}: stored passages kept as they were")
+        self.assertEqual(list(after["section_chunks"])[:3], ["biography", "background_and_work", "legacy"])
+        self.assertEqual(after["sections_available"][:3], ["biography", "background_and_work", "legacy"])
+        scored = quality.evaluate_profile(diagnosis.NAME_RULES, self._stored())
+        self.assertEqual(scored["points"]["coverage"], 14, "the stored titles keep their coverage")
+        self.assertEqual((self._stored()["daily_story_profile"]["status"], scored["status"]), ("ready", "ready"))
+        backup = self.local.db[repair.BACKUPS_COLLECTION].find_one({"profile_id": PID})
+        self.assertEqual(stored_bytes(backup["previous"]["rag_context"]), stored_bytes(before))
+        self.assertEqual(backup["policy"], repair.APPEND_POLICY_VERSION)
+        self.assertTrue(ada["identity"]["eligible"])
+        self.assertEqual(self.judge.call_count, 1, "the whole legend is judged again: its sources changed")
+        self.assertTrue(ada["now"]["writable"])
+
+        again = Scraper()
+        code, results = self._run(again)
+        self.assertEqual((results[PID]["outcome"], again.asked, self.judge.call_count), ("already_ready", [], 1))
+
+    def test_no_write_below_the_gate(self) -> None:
+        self.local.db["legend_scholars"].replace_one({"_id": PID}, legend(10, score=58))
+        before = self._stored()
+        code, results = self._run(Scraper(sentences=6))
+        ada = results[PID]
+        self.assertEqual(ada["outcome"], "not_written")
+        self.assertLess(ada["candidate"]["passages"], 20)
+        self.assertTrue(any("would score needs_data_repair" in s for s in ada["still_short"]), ada)
+        self.assertEqual(self._stored(), before)
+        self.assertEqual(self.local.db[repair.BACKUPS_COLLECTION].count_documents({}), 0)
+        self.assertEqual(self.judge.call_count, 0)
+
+    def test_a_passage_already_stored_is_skipped(self) -> None:
+        self.local.db["legend_scholars"].replace_one({"_id": PID}, legend(10, score=58))
+        code, results = self._run(Scraper(sentences=6))
+        first = results[PID]["candidate"]
+        # Store one passage the pipeline made from a fetched page, as if an
+        # earlier run had kept it; the saved pages are used again.
+        state = json.loads((self.work / PID / repair.STATE_FILES[repair.APPEND]).read_text(encoding="utf-8"))
+        chunks = json.loads(Path(state["fetched"]["chunks_path"]).read_text(encoding="utf-8"))["sections"]
+        text = next(c["text"] for cs in chunks.values() for c in cs)
+        self.local.db["legend_scholars"].update_one({"_id": PID}, {"$push": {"rag_context.section_chunks.legacy": {"chunk_id": "kept", "text": text, "primary_source_url": MUSEUM}}})
+        again = Scraper(sentences=6)
+        code, results = self._run(again)
+        second = results[PID]["candidate"]
+        self.assertEqual(again.asked, [], "the saved pages are reused")
+        self.assertEqual((second["added"], second["duplicates_skipped"]), (first["added"] - 1, first["duplicates_skipped"] + 1))
+
+    def test_a_rag_context_changed_meanwhile_is_not_overwritten(self) -> None:
+        db = self.local.db
+
+        class Meddling(Scraper):
+            async def extract_all(inner, url: str) -> Dict[str, Any]:
+                if not inner.asked:  # another writer adds a passage while the pages are fetched
+                    db["legend_scholars"].update_one({"_id": PID}, {"$push": {"rag_context.section_chunks.legacy": {"chunk_id": "theirs", "text": "x" * 500}}})
+                return await Scraper.extract_all(inner, url)
+
+        code, results = self._run(Meddling())
+        self.assertEqual((code, results[PID]["outcome"]), (1, "error"))
+        self.assertIn("changed since this run read it", results[PID]["error"])
+        self.assertEqual(self._stored()["rag_context"]["section_chunks"]["legacy"][-1]["chunk_id"], "theirs")
+        self.assertEqual(db[repair.BACKUPS_COLLECTION].count_documents({}), 0)
+
+    def test_a_dry_run_lists_the_urls_and_with_fetch_says_whether_each_would_pass(self) -> None:
+        before = snapshot(self.local.db)
+        scraper = Scraper()
+        code, text = self._run(scraper, dry_run=True)
+        self.assertEqual((code, scraper.asked, self.wikipedia.call_count), (0, [], 0))
+        self.assertFalse(self.work.exists(), "a plain dry run saves nothing")
+        self.assertIn(f"{PID} ({NAME}): repair, needs_data_repair 64: 19 passages stored", text)
+        self.assertIn("stored list: 9 URLs; 2 gave stored passages; 5 left out by the rules", text)
+        self.assertIn(f"would fetch the 2 that gave none:\n        - {NASA}\n        - {COLLEGE}\n", text)
+        self.assertIn("after appending: 19 + what these pages give; it passes only with at least 1 new passages (20 in all", text)
+        self.assertIn("Brave Search API: none (an append does not search)", text)
+        self.assertIn("Wikipedia API: 3 to 6 requests a legend x 1 legends to look up", text)
+
+        code, text = self._run(scraper, dry_run=True, fetch=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(same_pages(scraper.asked), same_pages([NASA, COLLEGE, SMITHSONIAN]))
+        self.assertEqual((snapshot(self.local.db), self.judge.call_count), (before, 0), "--fetch writes nothing to the database, asks no model")
+        self.assertRegex(text, r"fetched \S+: 3 URLs \(2 from the stored list, 1 from Wikipedia\):")
+        self.assertRegex(text, r"after appending: 19 \+ \d+ new = \d+ passages, ready \d+, \d+ creditable from \d+ pages: WOULD PASS and be written")
+
+        again = Scraper()
+        code, results = self._run(again)
+        self.assertEqual((results[PID]["outcome"], again.asked), ("written", []), "the run uses the pages the dry run fetched")
 
 
 if __name__ == "__main__":
